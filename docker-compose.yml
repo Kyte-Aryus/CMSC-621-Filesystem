@@ -1,0 +1,43 @@
+version: "3.8"
+
+services:
+
+  node0:
+    image: fsnode
+    ports:
+      - 8880:8880
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      SOMETHING: node0
+
+  node1:
+    image: fsnode
+    ports:
+      - 8881:8881
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      SOMETHING: node1
+
+  node2: 
+    image: fsnode
+    ports:
+      - 8882:8882
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      SOMETHING: node2
+
+  manager:
+    image: rabbitmq:3-management
+    ports:
+      - 8883:8883
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      SOMETHING: node-manager
