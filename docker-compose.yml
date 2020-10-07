@@ -11,6 +11,7 @@ services:
       - ./:/app
     environment:
       SOMETHING: node0
+    privileged: true
 
   node1:
     image: fsnode
@@ -21,6 +22,7 @@ services:
       - ./:/app
     environment:
       SOMETHING: node1
+    privileged: true
 
   node2: 
     image: fsnode
@@ -31,6 +33,7 @@ services:
       - ./:/app
     environment:
       SOMETHING: node2
+    privileged: true
 
   manager:
     image: rabbitmq:3-management
