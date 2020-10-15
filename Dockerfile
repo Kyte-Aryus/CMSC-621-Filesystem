@@ -18,8 +18,14 @@ RUN pip3 install pika
 RUN mkdir -p /filesystem
 RUN mkdir -p /mountpoint
 
+# RabbitMQ plugins.
+RUN rabbitmq-plugins enable rabbitmq_management
+
 # Instead of copying files, I am using a bind mount. See docker-compose.yml.
 WORKDIR /app
+
+# The RabbitMQ config file needs to be copied.
+COPY rabbitmq.conf /etc/rabbitmq/
 
 # Start RabbitMQ server and run Fuse filesystem on container start.
 CMD ["sh", "-c", "chmod +x ./start.sh && ./start.sh"]

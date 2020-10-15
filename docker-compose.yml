@@ -13,8 +13,6 @@ services:
       RABBITMQ_ERLANG_COOKIE: cookiemonster
       RABBITMQ_NODENAME: rabbit@node0
     privileged: true
-    depends_on:
-      - "manager"
 
   node1:
     image: fsnode
@@ -27,8 +25,6 @@ services:
       RABBITMQ_ERLANG_COOKIE: cookiemonster
       RABBITMQ_NODENAME: rabbit@node1
     privileged: true
-    depends_on:
-      - "manager"
 
   node2: 
     image: fsnode
@@ -41,8 +37,6 @@ services:
       RABBITMQ_ERLANG_COOKIE: cookiemonster
       RABBITMQ_NODENAME: rabbit@node2
     privileged: true
-    depends_on:
-      - "manager"
 
   manager:
     image: rabbitmq:3-management
