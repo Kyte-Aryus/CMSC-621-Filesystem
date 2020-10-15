@@ -1,7 +1,5 @@
 #!/usr/bin/env python
 
-# Loopback code from https://github.com/terencehonles/fusepy/blob/master/examples/loopback.py
-
 from __future__ import print_function, absolute_import, division
 
 import logging
@@ -15,24 +13,41 @@ import os
 
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 
+class CABNfs(LoggingMixIn, Operations):
 
-class Loopback(LoggingMixIn, Operations):
-    def __init__(self, root):
+    def __init__(self, root, replication_factor):
+        self.replication_factor = int(replication_factor)
         self.root = realpath(root)
         self.rwlock = Lock()
 
     def __call__(self, op, path, *args):
-        return super(Loopback, self).__call__(op, self.root + path, *args)
+        return super(CABNfs, self).__call__(op, self.root + path, *args)
+
+    # Functions which are not implemented
+    getxattr = None
+    listxattr = None
+    mkdir = None
+    rmdir = None
+    chmod = None
+    chown = None
+    symlink = None
+    readlink = None
+
+    # Functions which can be base functions
+    mknod = os.mknod
+    utimens = os.utime
+
+    # Functions with custom logic
+
+    def open(self, path, flags, mode):
+        return os.open(path, flags, mode)
 
     def access(self, path, mode):
         if not os.access(path, mode):
             raise FuseOSError(EACCES)
 
-    chmod = os.chmod
-    chown = os.chown
-
     def create(self, path, mode):
-        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
 
     def flush(self, path, fh):
         return os.fsync(fh)
@@ -48,15 +63,8 @@ class Loopback(LoggingMixIn, Operations):
         return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
             'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
 
-    getxattr = None
-
     def link(self, target, source):
         return os.link(source, target)
-
-    listxattr = None
-    mkdir = os.mkdir
-    mknod = os.mknod
-    open = os.open
 
     def read(self, path, size, offset, fh):
         with self.rwlock:
@@ -66,15 +74,11 @@ class Loopback(LoggingMixIn, Operations):
     def readdir(self, path, fh):
         return ['.', '..'] + os.listdir(path)
 
-    readlink = os.readlink
-
     def release(self, path, fh):
         return os.close(fh)
 
     def rename(self, old, new):
         return os.rename(old, self.root + new)
-
-    rmdir = os.rmdir
 
     def statfs(self, path):
         stv = os.statvfs(path)
@@ -82,15 +86,12 @@ class Loopback(LoggingMixIn, Operations):
             'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
             'f_frsize', 'f_namemax'))
 
-    def symlink(self, target, source):
-        return os.symlink(source, target)
-
     def truncate(self, path, length, fh=None):
         with open(path, 'r+') as f:
             f.truncate(length)
 
-    unlink = os.unlink
-    utimens = os.utime
+    def unlink(self, path):
+        return os.unlink(path)
 
     def write(self, path, data, offset, fh):
         with self.rwlock:
@@ -99,10 +100,11 @@ class Loopback(LoggingMixIn, Operations):
 
 
 if __name__ == '__main__':
-    if len(argv) != 3:
-        print('usage: %s <root> <mountpoint>' % argv[0])
+    if len(argv) != 4:
+        print('usage: %s <root> <mountpoint> <replication_factor>' % argv[0])
         exit(1)
 
     logging.basicConfig(filename="/app/debug_log.txt", level=logging.DEBUG)
 
-    fuse = FUSE(Loopback(argv[1]), argv[2], foreground=True)
+    filesystem = CABNfs(argv[1], argv[3])
+    fuse = FUSE(filesystem, argv[2], foreground=True)
