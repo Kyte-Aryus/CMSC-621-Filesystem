@@ -10,8 +10,8 @@ tv28617@umbc.edu
 3. Start the cluster containers with `docker-compose up -d`
 4. View logs with `docker-compose logs -f`
 5. Open a container CLI using the Docker Dashboard.
-6. Set up a receiver on a node using `python3 src/receiver.py`
-7. On another node, send a message using `python3 src/sender.py`
+6. Set up a receiver on a node using `python3 src/listen.py`
+7. On another node, send a message using one of `python3 src/example_send_node0.py`, `python3 src/on_join.py`, or `python3 src/on_leave.py`, which send a message to node 0, all nodes informing of a join, or all nodes informing of a leave respectively.
 8. View cluster metrics at `http://localhost:15672` (guest/guest).
 9. Shutdown the cluster with `docker-compose down`
 
@@ -21,7 +21,4 @@ On startup, the nodes will run `src/loopback.py` passing in the directories `/fi
 
 ## Notes.
 
-Right now, a three node cluster will be created. All the containers in the cluster are automatically attached to a same network. I also have a RabbitMQ manager node start for monitoring. Note that the manager node is not needed for the filesystem to run, it is just used for monitoring. I'm using a bind mount so that the code in the containers is always synced with whatever the code is in the repo on the host. The nodes are based on the RabbitMQ image. On container start, `src/loopback.py` is run.   
-
-1. For some reason, detailed node statistics are not showing up on the manager monitor. 
-2. For replication to occur, we need to use a queue type that supports replication: https://www.rabbitmq.com/clustering.html#cluster-membership 
+On container start, `src/loopback.py` is run. For some reason, detailed node statistics are not showing up on the manager monitor. 

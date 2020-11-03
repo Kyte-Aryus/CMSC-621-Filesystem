@@ -38,6 +38,30 @@ services:
       RABBITMQ_NODENAME: rabbit@node2
     privileged: true
 
+  node3: 
+    image: fsnode
+    ports:
+      - 8883:8883
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      RABBITMQ_ERLANG_COOKIE: cookiemonster
+      RABBITMQ_NODENAME: rabbit@node3
+    privileged: true
+
+  node4: 
+    image: fsnode
+    ports:
+      - 8884:8884
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      RABBITMQ_ERLANG_COOKIE: cookiemonster
+      RABBITMQ_NODENAME: rabbit@node4
+    privileged: true
+
   manager:
     image: rabbitmq:3-management
     ports:
