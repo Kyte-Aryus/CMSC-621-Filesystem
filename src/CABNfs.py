@@ -2,29 +2,125 @@
 
 from __future__ import print_function, absolute_import, division
 
-import logging
-
 from errno import EACCES
-from os.path import realpath
 from sys import argv, exit
-from threading import Lock
+import logging
+import threading
+import os.path
+import json
+import pika
 
 import os
 
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 
-
 class CABNfs(LoggingMixIn, Operations):
 
     def __init__(self, root, replication_factor):
         self.replication_factor = int(replication_factor)
-        self.root = realpath(root)
-        self.rwlock = Lock()
+        self.root = os.path.realpath(root)
+        self.rwlock = threading.Lock()
+
+        # Define maps and lists
+        self.currentNodeAliveCount = 1
+        self.filePrimaryMap = dict()
+        self.localVersionIdMap = dict()
+        self.givenLeasesMap = dict()    # Lease can only if we're the primary for the file
+        self.heldLeasesMap = dict()     # Strictly for writing
+
+        # Open the versionID file and load
+        self.versionFilePath = os.environ['VERSION_ID_FILE']
+        self.versionIdMap = dict()
+        self.read_version_file()
+        print(self.versionIdMap)
+
+        # Scan local files on the system and put them in a list
+        self.localFiles = list()
+        for file in os.listdir(root):
+            self.localFiles.append(os.path.join(root, file))
+
+        # If local file doesn't have a version ID, make it one
+        # Not that this indicates an inconsistency
+        for file in self.localFiles:
+            if file not in self.versionIdMap:
+                self.versionIdMap[file] = 1
+
+        # For each local file request primary server statuses
+        # NOTE: If a primary exists it will send back its status
+        # and either a "replicate" command if this server should
+        # hold a replica or a "delete" command if this server should
+        # delete its copy
+
+        # If no primary, determine if < replication_factor / 2 responses
+        # and select a primary if so
+
+        # Request all files in system
+
+
+
+
+
+        # Update replica mapping
+
+        # If < replication_factor / 2 responses, no mapping is defined
+
+        # Updating lease mapping
+
+        # Start listening thread
+        self.listening_thread = threading.Thread(target=self.listening_thread_client_function, daemon=True)
+        self.listening_thread.start()
+
+    def read_version_file(self):
+        if os.path.isfile(self.versionFilePath):
+            file = open(self.versionFilePath, "r")
+            for line in file:
+                tokens = line.split(':')
+                self.versionIdMap[tokens[0]] = tokens[1].strip()
+            file.close()
+
+    def update_version_file(self):
+        file = open(self.versionFilePath, "w")
+        for filepath in self.versionIdMap:
+            file.write("{0}:{1}\n".format(filepath, self.versionIdMap[filepath]))
+        file.close()
 
     def _real_path(self, path):
         if path[0] == '/':
             path = path[1:]
         return os.path.join(self.root, path)
+
+    def listening_thread_client_function(self):
+
+        nodename = os.environ['RABBITMQ_NODENAME']
+
+        connection = pika.BlockingConnection(pika.ConnectionParameters(host='localhost'))
+        channel = connection.channel()
+
+        channel.exchange_declare(exchange='direct_main', exchange_type='direct')
+        result = channel.queue_declare(queue='', exclusive=True)
+        queue_name = result.method.queue
+
+        channel.queue_bind(exchange='direct_main', queue=queue_name,
+                           routing_key='all_nodes')  # Listen for messages sent to all nodes.
+        channel.queue_bind(exchange='direct_main', queue=queue_name,
+                           routing_key=nodename)  # Listen for messages sent to this node.
+
+        # Logic goes here.
+        def callback(ch, method, properties, body):
+            data = json.loads(body)
+            if data['event_type'] == 'cluster_join':
+                logging.debug(' [x] %r joined the cluster' % (data['sender']))
+            elif data['event_type'] == 'cluster_leave':
+                logging.debug(' [x] %r left the cluster' % (data['sender']))
+            elif method.routing_key == nodename:
+                logging.debug(' [x] Received a personal message!')
+            else:
+                logging.debug(' [x] Unhandled message received.')
+
+        channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=True)
+
+        logging.info(' [*] Waiting for messages. To exit press CTRL+C')
+        channel.start_consuming()
 
     # Functions which are not implemented
     getxattr = None
@@ -70,6 +166,13 @@ class CABNfs(LoggingMixIn, Operations):
         return os.open(self._real_path(path), flags)
 
     def create(self, path, mode):
+
+        # Verify non-existence on other servers
+
+        # Create the file locally
+
+        #
+
         return os.open(self._real_path(path), os.O_WRONLY | os.O_CREAT, mode)
 
     def flush(self, path, fh):
@@ -112,5 +215,6 @@ if __name__ == '__main__':
 
     logging.basicConfig(filename="/app/debug_log.txt", level=logging.DEBUG)
 
+    # Setup filesystem
     filesystem = CABNfs(argv[1], argv[3])
     fuse = FUSE(filesystem, argv[2], foreground=True)
