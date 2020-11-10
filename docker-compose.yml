@@ -13,7 +13,7 @@ services:
       RABBITMQ_ERLANG_COOKIE: cookiemonster
       RABBITMQ_NODENAME: rabbit@node0
       VERSION_ID_FILE: /opt/versionIds.txt
-      NODE_COUNT_FOR_WRITES: 5
+      NODE_COUNT: 5
     privileged: true
 
   node1:
@@ -27,7 +27,7 @@ services:
       RABBITMQ_ERLANG_COOKIE: cookiemonster
       RABBITMQ_NODENAME: rabbit@node1
       VERSION_ID_FILE: /opt/versionIds.txt
-      NODE_COUNT_FOR_WRITES: 5
+      NODE_COUNT: 5
     privileged: true
 
   node2: 
@@ -41,7 +41,7 @@ services:
       RABBITMQ_ERLANG_COOKIE: cookiemonster
       RABBITMQ_NODENAME: rabbit@node2
       VERSION_ID_FILE: /opt/versionIds.txt
-      NODE_COUNT_FOR_WRITES: 5
+      NODE_COUNT: 5
     privileged: true
 
   node3: 
@@ -55,7 +55,7 @@ services:
       RABBITMQ_ERLANG_COOKIE: cookiemonster
       RABBITMQ_NODENAME: rabbit@node3
       VERSION_ID_FILE: /opt/versionIds.txt
-      NODE_COUNT_FOR_WRITES: 5
+      NODE_COUNT: 5
     privileged: true
 
   node4: 
@@ -69,7 +69,7 @@ services:
       RABBITMQ_ERLANG_COOKIE: cookiemonster
       RABBITMQ_NODENAME: rabbit@node4
       VERSION_ID_FILE: /opt/versionIds.txt
-      NODE_COUNT_FOR_WRITES: 5
+      NODE_COUNT: 5
     privileged: true
 
   manager:
