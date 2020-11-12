@@ -12,6 +12,9 @@ import pika
 import os
 import uuid
 import time
+import itertools
+import copy
+import shutil
 
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 
@@ -19,9 +22,12 @@ from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 class CABNfs(LoggingMixIn, Operations):
 
     def __init__(self, root, replication_factor):
+
+        # Structural setup
         self.replication_factor = int(replication_factor)
         self.root = os.path.realpath(root)
         self.rwlock = threading.Lock()
+        self.messaging_lock = threading.Lock()
         self.max_node_count = os.environ['NODE_COUNT']
 
         # Rabbitmq setup
@@ -29,13 +35,16 @@ class CABNfs(LoggingMixIn, Operations):
         self.responses = list()
         self.expecting_responses = False
         self.curr_response_corr_id = None
-        self.requests_timeout = 0.5  # Half second
+        self.requests_timeout = 1.5  # One second more than TTL
+        self.requests_ttl = '500'
 
         # Needed queues
         self.broadcast_queuename = "broadcast_queue_" + self.node_name
         self.broadcast_queue = None
         self.response_queuename = "response_queue_" + self.node_name
         self.response_queue = None
+        self.direct_queuename = "direct_queue_" + self.node_name
+        self.direct_queue = None
 
         # Setup main thread connection
         self.rabbitmq_main_connection = pika.BlockingConnection(pika.ConnectionParameters(host='localhost'))
@@ -46,9 +55,12 @@ class CABNfs(LoggingMixIn, Operations):
         broadcast_listening_thread.start()
         response_listening_thread = threading.Thread(target=self.response_listening_thread_function, daemon=True)
         response_listening_thread.start()
+        direct_listening_thread = threading.Thread(target=self.direct_listening_thread_function, daemon=True)
+        direct_listening_thread.start()
 
         # Define file and status tracking
         self.current_node_alive_count = 1
+        self.file_replica_map = dict()  # Only relevent if we're primary
         self.file_primary_map = dict()
         self.local_version_id_dict = dict()
         self.given_leases_dict = dict()  # Lease can only if we're the primary for the file
@@ -57,7 +69,6 @@ class CABNfs(LoggingMixIn, Operations):
         # Open the versionID file and load
         self.version_file_path = os.environ['VERSION_ID_FILE']
         self.local_version_id_dict = self.read_version_file()
-        print(self.local_version_id_dict)
 
         # Scan local files on the system and put them in a list
         local_files = list()
@@ -67,83 +78,42 @@ class CABNfs(LoggingMixIn, Operations):
         for file in local_files:
 
             # If local file doesn't have a version ID, make it one
-            # Not that this indicates an inconsistency
+            # Not that this indicates an inconsistency and should never happen
             if file not in self.local_version_id_dict:
                 logging.warning("Version ID not found for file: " + file)
                 self.local_version_id_dict[file] = 1
 
-            # For each local file determine primary server statuses
-            self.determine_primary(file)
+        # Request all files in the system
+        responses = self.process_request_with_response({}, 'broadcast', 'broadcast.request.files',
+                                                       self.max_node_count - 1)
+        # Iterate through each file in each response
+        for response in responses:
+            files = response['files']
+            for file in files:
 
-            # If no primary was found make node the primary
-            if file not in self.file_primary_map:
+                # If it's the first time we've seen this file or we don't know it's primary
+                if file['name'] not in self.file_primary_map or self.file_primary_map[file['name']] is None:
+                    self.file_primary_map[file['name']] = file['primary']
 
-                print('promote')
-                # TODO
-                #self.promote_to_primary(file)
+        # self.file_primary_map now contains all files,
+        # for each file we own that doesn't have a primary, promote this node
+        for file in self.file_primary_map:
+            if self.file_primary_map['file'] is None:
+                self.promote_to_primary(file)
 
-        # Request all files in system
+        # At this point, all primaries for all files should be known
+        for file in self.file_primary_map:
+            if self.file_primary_map['file'] is None:
+                print("WARNING: Unknown primary for file " + file + " at startup")
 
     # =================== BEGIN UTILITY FUNCTIONS ===================
 
-    # Determines the primary for a file, if none exists and assignPrimary
-    # is True, then it will assign this node as primary (with everything
-    # that entails) if no primary is found
-    def determine_primary(self, filepath):
+    # Constructs queuename for direct messages
+    @staticmethod
+    def get_direct_topic_prefix(node):
+        return "direct." + node + "."
 
-        # If we know the primary, we're done
-        if filepath in self.file_primary_map:
-            return self.file_primary_map[filepath]
-
-        # Need to request from other nodes
-
-        # Prep responses
-        self.responses = []
-        self.curr_response_corr_id = str(uuid.uuid4())  # For tracking responses to request.
-
-        # Request responses
-        print('SENDING')
-        self.rabbitmq_main_channel.basic_publish(
-            exchange='broadcast',
-            routing_key='broadcast.request.primary_status',
-            properties=pika.BasicProperties(
-                reply_to=self.response_queuename,
-                correlation_id=self.curr_response_corr_id,
-            ),
-            body="")  # This assumes that x is a dict.
-
-        start_time = int(time.time())
-        timeout_time = start_time + self.requests_timeout
-        while len(self.responses) < self.replication_factor:  # Maximum response is number of replications
-            self.rabbitmq_main_connection.process_data_events()
-            if time.time() >= timeout_time:
-                break
-
-        print(self.responses)
-
-        # Check responses
-        for response in self.responses:
-
-            # Check if server is primary
-            if 'is_primary' in reponse and reponse['is_primary'] == 'True':
-                self.file_primary_map[filepath] = response['server']
-
-                # If a primary exists it will either tell this server to keep
-                # it's replica or to delete it
-
-                if 'keep_file' in reponse:
-
-                    # Need to update with most recent
-                    if response['keep_file'] == 'True':
-                        self.update_replica_from_primary(filename)
-
-                    # Else do a remove on the root filesystem
-                    elif response['keep_file'] == 'False':
-                        del_path = filepath
-                        if not filepath.startswith(self.root):
-                            del_path = self._real_path(del_path)
-                        os.unlink(del_path)
-
+    # Reads version file from disk to find version IDs
     def read_version_file(self):
         version_id_dict = dict()
         if os.path.isfile(self.version_file_path):
@@ -154,12 +124,168 @@ class CABNfs(LoggingMixIn, Operations):
             file.close()
         return version_id_dict
 
+    # Updates version file on disk
     def update_version_file(self):
         file = open(self.version_file_path, "w")
         for filepath in self.local_version_id_dict:
             file.write("{0}:{1}\n".format(filepath, self.local_version_id_dict[filepath]))
         file.close()
 
+    # Can only be called if this node is primary for the file
+    # It attempts to distribute self.replication_factor - 1 number
+    # of replicas across nodes (prioritizing nodes with lowest disk space)
+    # If that many replicas cannot be made, it makes as many as possible
+    # NOTE: This operation includes deleting replicas off of the nodes it
+    # deems shouldn't have a primary
+    def balance_replicas(self, file):
+
+        # Verify we're primary
+        if file not in self.file_primary_map or self.file_primary_map[file] != self.node_name:
+            return
+
+        # Request replica existence and disk space from other nodes
+        data = {'file': filepath}
+        responses = self.process_request_with_response(data, 'broadcast', 'broadcast.request.replica_info',
+                                                       self.max_node_count - 1)
+
+        # Find disk usages and who has replicas
+        node_to_disk_free_map = dict()
+        node_has_replica_map = dict()
+        current_replica_nodes = list()
+        for response in responses:
+            node_to_disk_free_map[response['sender']] = response['disk_free']
+            node_has_replica_map[response['sender']] = response['has_replica']
+
+            if response['has_replica']:
+                current_replica_nodes.append(response['sender'])
+
+        # Sort by disk free and trim to the replication factor - 1
+        node_to_disk_free_map = sorted(node_to_disk_free_map.xitems(), key=operator.itemgetter(1), reverse=True)
+        desired_replication_nodes = itertools.islice(node_to_disk_free_map.iteritems(), self.replication_factor - 1)
+
+        # Now loop through each node that responded and determine what to do
+        for node in node_has_replica_map:
+
+            # Case 1, node has replica and shouldn't
+            if node_has_replica_map[node] and node not in desired_replication_nodes:
+
+                # Tell it to delete the file
+                data = {'file': filepath}
+                response = self.process_request_with_response(data, 'direct',
+                                                              self.get_direct_topic_prefix(node) + 'delete_replica')
+
+                # If succeeded, remove as replica holder
+                if len(response) != 0:
+                    current_replica_nodes.remove(node)
+
+            # Case 2, node doesn't have replica and should
+            elif not node_has_replica_map[node] and node in desired_replication_nodes:
+
+                # Send the replica
+                if self.replicate_file_to_node(file, node):
+
+                    # If succeeded, add as replica holder
+                    current_replica_nodes.append(node)
+
+            # All other cases do nothing
+
+        # Finally, make sure the replica map is up to date
+        self.file_replica_map[file] = current_replica_nodes
+
+        # Note that we don't care how many replicas are actually created here, this is a 'best-effort' algorithm
+        # without strong guarantees. Due to the nature of the algorithm, all replicas must be consistent
+        # and replicas only exist for fault tolerance in the case of disk failure. If an improper number
+        # of replicas exist, it will attempt to rebalanced periodically until the proper number exists
+
+    # Determines the primary for a file
+    def determine_primary(self, filepath):
+
+        # If we know the primary, we're done
+        if filepath in self.file_primary_map:
+            return self.file_primary_map[filepath]
+
+        # Need to request from other nodes
+        data = {'file': filepath}
+        responses = self.process_request_with_response(data, 'broadcast',
+                                                       'broadcast.request.primary_status', self.max_node_count - 1)
+
+        # If we have too many primaries, we need to force them in order until one takes
+        # Re-promote it to force this
+        if len(responses) > 1:
+            for response in responses:
+                node = response['sender']
+                data = {}
+                inner_response = self.process_request_with_response(data, 'direct',
+                                                                    self.get_direct_topic_prefix(node) + 'promote', 1)
+                if len(inner_response) == 1:
+                    return node
+
+            # If none succeeded, nobody is primary
+            return None
+
+        # If there is a primary, return it
+        elif len(responses) == 1:
+            return responses[0]['sender']
+
+        # Otherwise there is none
+        return None
+
+    # Promotes current node to primary for a file
+    # This is a destructive operation, if any other server
+    # is currently the primary, it will be swapped
+    def promote_to_primary(self, file):
+
+        # Only allow promotion if we have the file locally
+        if file not in self.local_version_id_dict:
+            return
+
+        # Notify all nodes of new primary
+        data = {'file': file}
+        self.process_request(data, 'broadcast', 'broadcast.update.primary')
+
+        # Update own map
+        self.file_primary_map[file] = self.node_name
+
+        # Re-balance replicas while we're here
+        self.balance_replicas(file)
+
+    #TODO
+    def replicate_file_to_node(self, file, node):
+
+        # Fetch file
+
+        # Send over rabbit MQ to node
+
+        # Check if succeeded
+
+        # Return succeeded
+        return True
+
+    # TODO
+    def process_full_delete(self, file):
+
+        # Check primary status
+
+        # Send replica delete requests
+
+        # Delete locally
+
+        # Update queues
+
+    def delete_local_file(self, file):
+        del_path = file
+        if not filepath.startswith(self.root):
+            del_path = self._real_path(del_path)
+
+        if os.path.exists(del_path):
+            os.unlink(del_path)
+
+            # Clean up queue
+            if file in self.local_version_id_dict:
+                self.local_version_id_dict.pop(file)
+
+    # Call this on a relative path or a mount path
+    # to get the real path
     def _real_path(self, path):
         if path[0] == '/':
             path = path[1:]
@@ -169,6 +295,67 @@ class CABNfs(LoggingMixIn, Operations):
 
     # =================== BEGIN MESSAGING FUNCTIONS ===================
 
+    # Sends the data on the broadcast exchange given the routing key of topic
+    # Returns after timeout or when max_responses are recieved
+    # Note that this method returns the responses to preserve thread safety
+    def process_request_with_response(self, data, exchange, topic, max_responses):
+
+        # Ensure only one request is processed at a time
+        with self.messaging_lock:
+
+            # Prep response node
+            self.responses = []
+            self.curr_response_corr_id = str(uuid.uuid4())  # For tracking responses to request.
+
+            self.process_request(data, exchange, topic)
+
+            # Nodes with copies of the file will respond that they have copies
+            # So the primary can keep a copy of the replica map
+            start_time = int(time.time())
+            timeout_time = start_time + self.requests_timeout
+            while len(self.responses) < max_responses:  # Up to replication factor can respond
+                self.rabbitmq_main_connection.process_data_events()
+                if time.time() >= timeout_time:
+                    break
+
+            return_dict = copy.deepcopy(self.responses)
+
+            print("Responses for: " + topic)
+            print(return_dict)
+
+            return return_dict
+
+    # Sends the data on the broadcast exchange given the routing key of topic
+    # Does not wait for responses
+    def process_request(self, data, exchange, topic):
+
+        # Messages must always have a sender, this just enforces that
+        data['sender'] = self.node_name
+
+        self.rabbitmq_main_channel.basic_publish(
+            exchange=exchange,
+            routing_key=topic,
+            properties=pika.BasicProperties(
+                reply_to=self.response_queuename,
+                correlation_id=self.curr_response_corr_id,
+                expiration=self.requests_ttl
+            ),
+            body=json.dumps(data))  # This assumes that x is a dict.
+
+    # Sends reply
+    def process_reply(self, data, channel, props):
+
+        # Messages must always have a sender, this just enforces that
+        data['sender'] = self.node_name
+
+        channel.basic_publish(exchange='',
+                              routing_key=props.reply_to,
+                              properties=pika.BasicProperties(correlation_id=props.correlation_id,
+                                                              expiration=self.requests_ttl),
+                              body=json.dumps(data))
+
+
+    # Thread function which handles listening for broadcast messages
     def broadcast_listening_thread_function(self):
 
         # Rabbitmq broadcast queue
@@ -181,42 +368,91 @@ class CABNfs(LoggingMixIn, Operations):
                                               routing_key='broadcast.#')  # Listen for messages sent to all nodes
 
         # Logic goes here.
-        def callback(ch, method, properties, body):
-
-            print("Recv")
+        def callback(channel, method, props, body):
 
             # Don't read from this node
-            if properties.reply_to is not None and properties.reply_to == self.response_queuename:
-                print("discard")
+            if props.reply_to is not None and props.reply_to == self.response_queuename:
                 return
 
+            payload = json.loads(body)
+            sender = payload['sender']
 
-            if method.routing_key == 'broadcast.event.join':
-                logging.info(' [x] %r joined the cluster with topic')
-            elif method.routing_key == 'broadcast.event.leave':
-                logging.info(' [x] %r left the cluster with topic')
+            print("Got request for " + method.routing_key)
+
+            if method.routing_key == 'broadcast.request.files':
+
+                files = dict()
+
+                # Send file list with primary status for local files only
+                for file in self.local_version_id_dict:
+                    if file in self.file_primary_map:
+                        files[file] = self.file_primary_map[file]
+                    else:
+                        files[file] = None
+
+                # Send reply
+                data = {'files': files}
+                self.process_reply(data, channel, props)
+
+            elif method.routing_key == 'broadcast.request.replica_info':
+                file = payload['file']
+
+                # First check if we have replica
+                has_replica = (file in self.local_version_id_dict)
+
+                # Now check disk space
+                (total, used, free) = shutil.disk_usage(self.root)
+                disk_free = float(free)
+
+                # Send message
+                data = {'has_replica': has_replica, 'disk_free': disk_free}
+                self.process_reply(data, channel, props)
+
+
             elif method.routing_key == 'broadcast.request.primary_status':
-                print(' [XXXXX] GOT PRIMARY STATUS REQUEST from %f', properties.reply_to)
+                file = payload['file']
+
+                # If we're primary, notify
+                if file in self.file_primary_map and self.file_primary_map[file] == self.node_name:
+                    self.process_reply({}, channel, props)
+
+            elif method.routing_key == 'broadcast.update.primary':
+                file = payload['file']
+
+                # Update local primary map
+                self.file_primary_map[file] = sender
+
+                # We can stop keeping track of replicas
+                self.file_replica_map = dict()
+
+                # Release given leases
+                for lease in self.given_leases_dict:
+
+                    #TODO
+                    # Send direct.node.revoke_lease message to each lease holder
+
+                self.given_leases_dict = dict()
+
             else:
-                logging.info(' [x] Unhandled message received.')
+                logging.info('Unhandled broadcast message received')
 
         rabbitmq_broadcast_channel.basic_consume(queue=self.broadcast_queuename,
                                                  on_message_callback=callback, auto_ack=True)
-
-        logging.info(' [*] Waiting for messages. To exit press CTRL+C')
         rabbitmq_broadcast_channel.start_consuming()
 
+    # Thread function which handles listening for responses
     def response_listening_thread_function(self):
 
         # Rabbitmq reply queue
         rabbitmq_response_connection = pika.BlockingConnection(pika.ConnectionParameters(host='localhost'))
         rabbitmq_response_channel = rabbitmq_response_connection.channel()
-        rabbitmq_response_channel.exchange_declare(exchange='response', exchange_type='direct')
+        #TODO Verify this line can be removed
+        # rabbitmq_response_channel.exchange_declare(exchange='response', exchange_type='direct')
         result = rabbitmq_response_channel.queue_declare(queue=self.response_queuename, exclusive=False)
         self.response_queue = result.method.queue
 
         # Handle responses.
-        def callback(self, ch, method, props, body):
+        def callback(ch, method, props, body):
             print("Got response")
             # If response to call.
             if self.curr_response_corr_id == props.correlation_id:
@@ -226,6 +462,74 @@ class CABNfs(LoggingMixIn, Operations):
         rabbitmq_response_channel.basic_consume(queue=self.response_queuename,
                                                 on_message_callback=callback, auto_ack=True)
         rabbitmq_response_channel.start_consuming()
+
+    # Thread function which handles listening for direct messages
+    def direct_listening_thread_function(self):
+
+        # Rabbitmq broadcast queue
+        rabbitmq_direct_connection = pika.BlockingConnection(pika.ConnectionParameters(host='localhost'))
+        rabbitmq_direct_channel = rabbitmq_direct_connection.channel()
+        rabbitmq_direct_channel.exchange_declare(exchange='direct', exchange_type='topic')
+        result = rabbitmq_direct_channel.queue_declare(queue=self.direct_queuename, exclusive=False)
+        self.direct_queue = result.method.queue
+
+        # Only listen to messages sent to this node with key direct.<node_name>.#
+        rabbitmq_direct_channel.queue_bind(exchange='direct', queue=self.direct_queuename,
+                                           routing_key='direct.' + self.node_name + '.#')
+
+        # Logic goes here.
+        def callback(ch, method, props, body):
+
+            # Don't read from this node
+            if props.reply_to is not None and props.reply_to == self.direct_queuename:
+                return
+
+            payload = json.loads(body)
+            sender = payload['sender']
+
+            # Delete requests
+            if method.routing_key.endswith('.delete_file'):
+                file = payload['file']
+
+                # Only process if primary
+                if self.file_primary_map[file] == self.node_name:
+                    self.process_full_delete(file)
+
+                    # Send an empty acknowledgement
+                    self.process_reply({}, ch, props)
+
+            elif method.routing_key.endswith('.delete_replica'):
+                file = payload['file']
+
+                # Verify the request came from the primary
+                if self.file_primary_map[file] == sender:
+
+                    # Process delete
+                    self.delete_local_file(file)
+
+                    # Send an empty acknowledgement
+                    self.process_reply({}, ch, props)
+
+            elif method.routing_key.endswith('.promote'):
+                file = payload['file']
+
+                # Verify the request came from the primary
+                if self.file_primary_map[file] == sender:
+                    self.promote_to_primary(file)
+
+            elif method.routing_key.endswith('.revoke_lease'):
+                file = payload['file']
+
+                # Revoke the lease
+                if file in self.held_leases_dict:
+                    self.held_leases_dict.pop(file)
+
+            else:
+                print('Unhandled direct message')
+
+        rabbitmq_direct_channel.basic_consume(queue=self.direct_queuename,
+                                              on_message_callback=callback, auto_ack=True)
+        rabbitmq_direct_channel.start_consuming()
 
     # =================== END MESSAGING FUNCTIONS ===================
 

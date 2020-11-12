@@ -3,6 +3,7 @@ import os
 import json
 import pika
 import uuid
+import time
 
 nodename = os.environ['RABBITMQ_NODENAME']  # This node's name.
 
@@ -46,8 +47,13 @@ class Client(object):
                 correlation_id=self.corr_id,
             ),
             body=json.dumps(x))  # This assumes that x is a dict.
+        start_time = int(time.time())
+        timeout_time = start_time + 2
         while len(self.response) < 2:  # Minimum responses needed. Set to 2 for testing.
             self.connection.process_data_events()
+            if time.time() >= timeout_time:
+                print("TIMEOUT!")
+                break
         return self.response
 
 # Make a request.
