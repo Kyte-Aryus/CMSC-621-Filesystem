@@ -73,7 +73,7 @@ class CABNfs(LoggingMixIn, Operations):
         # Scan local files on the system and put them in a list
         local_files = list()
         for file in os.listdir(root):
-            local_files.append(os.path.join(root, file))
+            local_files.append(os.basepath(file))
 
         for file in local_files:
 
@@ -94,6 +94,8 @@ class CABNfs(LoggingMixIn, Operations):
                 # If it's the first time we've seen this file or we don't know it's primary
                 if file['name'] not in self.file_primary_map or self.file_primary_map[file['name']] is None:
                     self.file_primary_map[file['name']] = file['primary']
+                else:
+                    self.file_primary_map[file['name']] = None
 
         # self.file_primary_map now contains all files,
         # for each file we own that doesn't have a primary, promote this node
@@ -120,7 +122,7 @@ class CABNfs(LoggingMixIn, Operations):
             file = open(self.version_file_path, "r")
             for line in file:
                 tokens = line.split(':')
-                version_id_dict[tokens[0]] = tokens[1].strip()
+                version_id_dict[os.basename(tokens[0])] = tokens[1].strip()
             file.close()
         return version_id_dict
 
@@ -249,17 +251,32 @@ class CABNfs(LoggingMixIn, Operations):
         # Re-balance replicas while we're here
         self.balance_replicas(file)
 
-    #TODO
     def replicate_file_to_node(self, file, node):
 
+        # Only primary can request a replicate
+        if self.file_primary_map[file] != self.node_name:
+            return
+
+        # Can only replicate if we have a local copy
+        if file not in self.local_version_id_dict:
+            return
+
         # Fetch file
+        if not filepath.startswith(self.root):
+            file = self._real_path(file)
+
+        handle = open(file, 'r')
+        contents = handle.read()
 
         # Send over rabbit MQ to node
+        data = {'file': file, 'contents': contents, 'version_id': self.local_version_id_dict[file]}
+        response = self.process_request_with_response(data, 'direct', self.get_direct_topic_prefix(node) + 'replicate',
+                                                      1)
 
         # Check if succeeded
-
-        # Return succeeded
-        return True
+        if len(response) == 1:
+            return True
+        return False
 
     # TODO
     def process_full_delete(self, file):
@@ -516,6 +533,22 @@ class CABNfs(LoggingMixIn, Operations):
                 # Verify the request came from the primary
                 if self.file_primary_map[file] == sender:
                     self.promote_to_primary(file)
+
+            elif method.routing_key.endswith('.replicate'):
+                file = payload['file']
+                if not filepath.startswith(self.root):
+                    file = self._real_path(file)
+
+                # Just write replica without checking
+                handle = open(file)
+                chars_written = handle.write(payload['contents'])
+
+                # Add to map
+                if chars_written > 0:
+                    self.local_version_id_dict[os.basepath(file)] = payload['version_id']
+
+                    # Send an empty acknowledgement
+                    self.process_reply({}, ch, props)
 
             elif method.routing_key.endswith('.revoke_lease'):
                 file = payload['file']
