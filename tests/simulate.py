@@ -36,6 +36,10 @@ results = {
 }
 
 
+# Create some data.
+data = 'a' * args.fs * 1000000
+
+
 # Action definitions.
 def toy():
     if random.random() < 0.1:
@@ -43,17 +47,52 @@ def toy():
     else:
         return 0
 
+def create_file(filename='testfile.txt'):
+    try:
+        with open(os.path.join(datadir, filename),'w') as fd:
+            fd.write(data)
+        return 0
+    except Exception as err:
+        print(err)
+        return 1
+
+def read_file(filename='testfile.txt'):
+    try:
+        with open(os.path.join(datadir, filename),'r') as fd:
+            _ = fd.read()
+        return 0
+    except Exception as err:
+        print(err)
+        return 1
+
+def append_file(filename='testfile.txt'):
+    try:
+        with open(os.path.join(datadir, filename),'a') as fd:
+            fd.write(data)
+        return 0
+    except Exception as err:
+        print(err)
+        return 1
+
 
 # Make sure we use a valid action.
-assert args.action in ['toy'], 'invalid action'
+assert args.action in ['toy','write_one','read_one','append_one'], 'invalid action'
 
 # Run loop.
 while True:
 
     # Run action.
     start_time = time.time()
+
     if args.action == 'toy':
         complete_success = toy()
+    elif args.action == 'write_one':
+        complete_success = create_file()
+    elif args.action == 'read_one':
+        complete_success = read_file()
+    elif args.action == 'append_one':
+        complete_success = append_file()
+
     complete_time = time.time()-start_time
 
     # Log results.
