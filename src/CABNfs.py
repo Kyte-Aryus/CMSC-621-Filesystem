@@ -495,8 +495,6 @@ class CABNfs(LoggingMixIn, Operations):
         # Rabbitmq reply queue
         rabbitmq_response_connection = pika.BlockingConnection(pika.ConnectionParameters(host='localhost'))
         rabbitmq_response_channel = rabbitmq_response_connection.channel()
-        #TODO Verify this line can be removed
-        # rabbitmq_response_channel.exchange_declare(exchange='response', exchange_type='direct')
         result = rabbitmq_response_channel.queue_declare(queue=self.response_queuename, exclusive=False)
         self.response_queue = result.method.queue
 
@@ -632,9 +630,6 @@ class CABNfs(LoggingMixIn, Operations):
                                                          'f_flag',
                                                          'f_frsize', 'f_namemax'))
 
-    def readdir(self, path, fh):
-        return ['.', '..'] + os.listdir(self._real_path(path))
-
     def access(self, path, mode):
         if not os.access(self._real_path(path), mode):
             raise FuseOSError(EACCES)
@@ -656,6 +651,9 @@ class CABNfs(LoggingMixIn, Operations):
 
     def flush(self, path, fh):
         return os.fsync(fh)
+
+    def readdir(self, path, fh):
+        return ['.', '..'] + os.listdir(self._real_path(path))
 
     def fsync(self, path, datasync, fh):
         if datasync != 0:
