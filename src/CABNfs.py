@@ -102,7 +102,7 @@ class CABNfs(LoggingMixIn, Operations):
                 # If it's the first time we've seen this file or we don't know it's primary
                 if file not in self.file_primary_map or self.file_primary_map[file] is None:
                     self.file_primary_map[file] = primary
-                else:
+                elif file not in self.file_primary_map:
                     self.file_primary_map[file] = None
 
         # Now add local files to make sure we have them all
@@ -151,6 +151,17 @@ class CABNfs(LoggingMixIn, Operations):
             handle.write("{0}:{1}\n".format(file, self.local_version_id_dict[file]))
         handle.close()
 
+    # Call this on a relative path or a mount path
+    # to get the real path
+    def _real_path(self, path):
+        if path[0] == '/':
+            path = path[1:]
+        return os.path.join(self.root, path)
+
+    # =================== END UTILITY FUNCTIONS ===================
+
+    # =================== BEGIN LIFECYCLE FUNCTIONS ===================
+
     # Can only be called if this node is primary for the file
     # It attempts to distribute self.replication_factor - 1 number
     # of replicas across nodes (prioritizing nodes with lowest disk space)
@@ -197,7 +208,7 @@ class CABNfs(LoggingMixIn, Operations):
                 # Tell it to delete the file
                 data = {'file': file}
                 response = self.process_request_with_response(data, 'direct',
-                                                              self.get_direct_topic_prefix(node) + 'delete_replica')
+                                                              self.get_direct_topic_prefix(node) + 'delete_replica', 1)
 
                 # If succeeded, remove as replica holder
                 if len(response) != 0:
@@ -307,6 +318,13 @@ class CABNfs(LoggingMixIn, Operations):
             return True
         return False
 
+    def on_shutdown(self):
+        print('Received shutdown command')
+
+    # =================== END LIFECYCLE FUNCTIONS ===================
+
+    # =================== BEGIN FILE OPERATION HELPER FUNCTIONS ===================
+
     # TODO
     def process_full_delete(self, file):
         return True
@@ -331,14 +349,7 @@ class CABNfs(LoggingMixIn, Operations):
             if file in self.local_version_id_dict:
                 self.local_version_id_dict.pop(file)
 
-    # Call this on a relative path or a mount path
-    # to get the real path
-    def _real_path(self, path):
-        if path[0] == '/':
-            path = path[1:]
-        return os.path.join(self.root, path)
-
-    # =================== END UTILITY FUNCTIONS ===================
+    # =================== END FILE OPERATION HELPER FUNCTIONS ===================
 
     # =================== BEGIN MESSAGING FUNCTIONS ===================
 
@@ -588,6 +599,9 @@ class CABNfs(LoggingMixIn, Operations):
                 if file in self.held_leases_dict:
                     self.held_leases_dict.pop(file)
 
+            elif method.routing_key.endswith('.shutdown'):
+                self.on_shutdown()
+
             else:
                 print('Unhandled direct message')
 
@@ -596,6 +610,8 @@ class CABNfs(LoggingMixIn, Operations):
         rabbitmq_direct_channel.start_consuming()
 
     # =================== END MESSAGING FUNCTIONS ===================
+
+    # =================== BEING FUSE API FUNCTIONS ===================
 
     # Functions which are not implemented
     getxattr = None
@@ -683,6 +699,8 @@ class CABNfs(LoggingMixIn, Operations):
         with self.rwlock:
             os.lseek(fh, offset, 0)
             return os.write(fh, data)
+
+    # =================== END FUSE API FUNCTIONS ===================
 
 
 if __name__ == '__main__':
