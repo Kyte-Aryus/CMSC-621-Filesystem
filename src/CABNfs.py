@@ -669,7 +669,13 @@ class CABNfs(LoggingMixIn, Operations):
         return os.fsync(fh)
 
     def readdir(self, path, fh):
-        return ['.', '..'] + os.listdir(self._real_path(path))
+        responses = self.process_request_with_response({}, 'broadcast', 'broadcast.request.files',
+                                                       self.max_node_count - 1)
+        all_files = set()
+        for response in responses:
+            all_files = all_files.union(response['files'].keys())
+        print(all_files)
+        return ['.', '..'] + list(all_files)
 
     def fsync(self, path, datasync, fh):
         if datasync != 0:
