@@ -79,7 +79,7 @@ class CABNfs(LoggingMixIn, Operations):
         for file in local_files:
 
             # If local file doesn't have a version ID, make it one
-            # Not that this indicates an inconsistency and should never happen
+            # Note that this indicates an inconsistency and should never happen
             if file not in self.local_version_id_dict:
                 logging.warning("Version ID not found for file: " + file)
                 self.local_version_id_dict[file] = 1
@@ -348,6 +348,14 @@ class CABNfs(LoggingMixIn, Operations):
             # Clean up queue
             if file in self.local_version_id_dict:
                 self.local_version_id_dict.pop(file)
+
+    def get_all_files(self):
+        responses = self.process_request_with_response({}, 'broadcast', 'broadcast.request.files',
+                                                self.max_node_count - 1)
+        all_files = set(list(self.file_primary_map.keys()))  # Files on this server.
+        for response in responses:
+            all_files = all_files.union(response['files'].keys())
+        return list(all_files)
 
     # =================== END FILE OPERATION HELPER FUNCTIONS ===================
 
@@ -656,27 +664,26 @@ class CABNfs(LoggingMixIn, Operations):
         return os.open(self._real_path(path), flags)
 
     def create(self, path, mode):
-        # if path[0] == '/':
-        #     path = path[1:]
-        
-        # # Verify non-existence on other servers
-        # all_files = self.get_all_files()
-        # if path in all_files:
-        #     return #?
-        # else:
-        #     # Create the file locally
-        #     os.open(self._real_path(path), os.O_WRONLY | os.O_CREAT, mode)
-
-
-        # #
-
-        return os.open(self._real_path(path), os.O_WRONLY | os.O_CREAT, mode)
+        if path[0] == '/':
+            path = path[1:]
+        # Verify non-existence on other servers.
+        if path in self.get_all_files():
+            # Raise exception if the file exists.
+            raise Exception('ERROR_FILE_EXISTS')  # Doesn't seem to do anything.
+        else:
+            # Create the file locally.
+            os.open(self._real_path(path), os.O_WRONLY | os.O_CREAT, mode)
+            # Set version ID.
+            self.local_version_id_dict[path] = 1
+            # Mark as primary and create replicas.
+            self.promote_to_primary(path)
+        return 
 
     def flush(self, path, fh):
         return os.fsync(fh)
 
     def readdir(self, path, fh):
-        return ['.', '..'] + list(self.file_primary_map.keys())
+        return ['.', '..'] + self.get_all_files()
 
     def fsync(self, path, datasync, fh):
         if datasync != 0:
