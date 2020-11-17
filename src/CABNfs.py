@@ -656,12 +656,19 @@ class CABNfs(LoggingMixIn, Operations):
         return os.open(self._real_path(path), flags)
 
     def create(self, path, mode):
+        # if path[0] == '/':
+        #     path = path[1:]
+        
+        # # Verify non-existence on other servers
+        # all_files = self.get_all_files()
+        # if path in all_files:
+        #     return #?
+        # else:
+        #     # Create the file locally
+        #     os.open(self._real_path(path), os.O_WRONLY | os.O_CREAT, mode)
 
-        # Verify non-existence on other servers
 
-        # Create the file locally
-
-        #
+        # #
 
         return os.open(self._real_path(path), os.O_WRONLY | os.O_CREAT, mode)
 
@@ -669,13 +676,7 @@ class CABNfs(LoggingMixIn, Operations):
         return os.fsync(fh)
 
     def readdir(self, path, fh):
-        responses = self.process_request_with_response({}, 'broadcast', 'broadcast.request.files',
-                                                       self.max_node_count - 1)
-        all_files = set()
-        for response in responses:
-            all_files = all_files.union(response['files'].keys())
-        print(all_files)
-        return ['.', '..'] + list(all_files)
+        return ['.', '..'] + list(self.file_primary_map.keys())
 
     def fsync(self, path, datasync, fh):
         if datasync != 0:
