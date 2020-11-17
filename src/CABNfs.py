@@ -327,6 +327,7 @@ class CABNfs(LoggingMixIn, Operations):
 
     # TODO
     def process_full_delete(self, file):
+        print('Deleting...')
         return True
 
         # Check primary status
@@ -354,7 +355,7 @@ class CABNfs(LoggingMixIn, Operations):
                                                 self.max_node_count - 1)
         all_files = set(list(self.file_primary_map.keys()))  # Files on this server.
         for response in responses:
-            all_files = all_files.union(response['files'].keys())
+            all_files = all_files.union(list(response['files'].keys()))
         return list(all_files)
 
     # =================== END FILE OPERATION HELPER FUNCTIONS ===================
@@ -706,8 +707,21 @@ class CABNfs(LoggingMixIn, Operations):
         with open(self._real_path(path), 'r+') as f:
             f.truncate(length)
 
-    def unlink(self, path):
-        return os.unlink(self._real_path(path))
+    def unlink(self, path):   # This only works if the file is present in /filesystem/ for some reason...
+        if path[0] == '/':
+            path = path[1:]
+        if self.file_primary_map[path] == self.node_name:
+            # If primary, delete.
+            self.process_full_delete(path)
+        else:
+            # Get the primary.
+            responses = self.process_request_with_response({'file': path}, 'broadcast', 'broadcast.request.primary_status', 1)
+            if len(responses) > 0:
+                primary = responses[0]['sender']
+                # Send the primary a delete request.
+                _ = self.process_request_with_response({'file': path}, 'direct',
+                                                    self.get_direct_topic_prefix(primary) + 'delete_file', 1)
+        return
 
     def write(self, path, data, offset, fh):
         with self.rwlock:
