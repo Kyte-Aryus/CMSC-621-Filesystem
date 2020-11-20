@@ -59,6 +59,9 @@ class CABNfs(LoggingMixIn, Operations):
         direct_listening_thread = threading.Thread(target=self.direct_listening_thread_function, daemon=True)
         direct_listening_thread.start()
 
+        # To prevent a rebalance delete
+        self.open_files = []
+
         # Define file and status tracking
         self.current_node_alive_count = 1
         self.file_replica_map = dict()  # Only relevent if we're primary
@@ -339,6 +342,12 @@ class CABNfs(LoggingMixIn, Operations):
         # Update queues
 
     def delete_local_file(self, file):
+
+        # Do not delete if file is open.
+        if file in self.open_files:
+            print('File open!')
+            return
+
         del_path = file
         if not file.startswith(self.root):
             del_path = self._real_path(del_path)
@@ -566,17 +575,20 @@ class CABNfs(LoggingMixIn, Operations):
                     # Send an empty acknowledgement
                     self.process_reply({}, ch, props)
 
-            elif method.routing_key.endswith('.delete_replica'):
+            elif method.routing_key.endswith('.request_replica'):
                 file = payload['file']
+                sender = payload['sender']
+                self.replicate_file_to_node(file, sender)
 
-                # Verify the request came from the primary
-                if self.file_primary_map[file] == sender:
-
-                    # Process delete
-                    self.delete_local_file(file)
-
-                    # Send an empty acknowledgement
-                    self.process_reply({}, ch, props)
+            elif method.routing_key.endswith('.request_lstat'):
+                file = payload['file']
+                st = os.lstat(self._real_path(file))
+                lst = dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
+                                                                    'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size',
+                                                                    'st_uid',
+                                                                    'st_dev', "st_ino", "st_rdev", "st_blksize", "st_blocks"))
+                print(lst)
+                self.process_reply(lst, ch, props)
 
             elif method.routing_key.endswith('.promote'):
                 file = payload['file']
@@ -642,11 +654,25 @@ class CABNfs(LoggingMixIn, Operations):
         return os.utime(self._real_path(path), times)
 
     def getattr(self, path, fh=None):
-        st = os.lstat(self._real_path(path))
-        return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
-                                                        'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size',
-                                                        'st_uid',
-                                                        'st_dev', "st_ino", "st_rdev", "st_blksize", "st_blocks"))
+        # Do we not have the file?
+        if (not os.path.isfile(self._real_path(path))) and (self._real_path(path).split('/')[-1] in self.get_all_files()):
+            if path[0] == '/':
+                path = path[1:]
+
+            # Get the primary.
+            responses = self.process_request_with_response({'file': path}, 'broadcast', 'broadcast.request.primary_status', 1)
+            if len(responses) > 0:
+                primary = responses[0]['sender']
+                # Send the primary a replication request.
+                st = self.process_request_with_response({'file': path, 'sender': self.node_name}, 'direct',
+                                                    self.get_direct_topic_prefix(primary) + 'request_lstat', 1)
+                return st[0]
+        else:
+            st = os.lstat(self._real_path(path))
+            return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
+                                                                    'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size',
+                                                                    'st_uid',
+                                                                    'st_dev', "st_ino", "st_rdev", "st_blksize", "st_blocks"))
 
     def statfs(self, path):
         stv = os.statvfs(self._real_path(path))
@@ -662,15 +688,32 @@ class CABNfs(LoggingMixIn, Operations):
     # Functions with custom logic
 
     def open(self, path, flags):
-        return os.open(self._real_path(path), flags)
+        if path[0] == '/':
+            path = path[1:]
+       
+        # To prevent a rebalance delete.
+        self.open_files.append(path)
+
+        # Do we have the file?
+        if os.path.isfile(self._real_path(path)):
+            return os.open(self._real_path(path), flags)
+        else:
+            # Get the primary.
+            responses = self.process_request_with_response({'file': path}, 'broadcast', 'broadcast.request.primary_status', 1)
+            if len(responses) > 0:
+                primary = responses[0]['sender']
+                # Send the primary a replication request.
+                _ = self.process_request_with_response({'file': path, 'sender': self.node_name}, 'direct',
+                                                    self.get_direct_topic_prefix(primary) + 'request_replica', 1)
+                return os.open(self._real_path(path), flags)
 
     def create(self, path, mode):
         if path[0] == '/':
             path = path[1:]
         # Verify non-existence on other servers.
         if path in self.get_all_files():
-            # Raise exception if the file exists.
-            raise Exception('ERROR_FILE_EXISTS')  # Doesn't seem to do anything.
+            # Log exception if the file exists.
+            logging.warning("ERROR_FILE_EXISTS: " + path)
         else:
             # Create the file locally.
             os.open(self._real_path(path), os.O_WRONLY | os.O_CREAT, mode)
@@ -698,6 +741,11 @@ class CABNfs(LoggingMixIn, Operations):
             return os.read(fh, size)
 
     def release(self, path, fh):
+        if path[0] == '/':
+            path = path[1:]
+        # To prevent a rebalance delete.
+        self.open_files.remove(path)
+
         return os.close(fh)
 
     def rename(self, old, new):
@@ -707,7 +755,7 @@ class CABNfs(LoggingMixIn, Operations):
         with open(self._real_path(path), 'r+') as f:
             f.truncate(length)
 
-    def unlink(self, path):   # This only works if the file is present in /filesystem/ for some reason...
+    def unlink(self, path):   
         if path[0] == '/':
             path = path[1:]
         if self.file_primary_map[path] == self.node_name:
@@ -736,7 +784,7 @@ if __name__ == '__main__':
         print('usage: %s <root> <mountpoint> <replication_factor>' % argv[0])
         exit(1)
 
-    logging.basicConfig(filename="/app/debug_log.txt", level=logging.INFO)
+    logging.basicConfig(filename="/app/debug_log.txt", level=logging.WARNING)
 
     # Setup filesystem
     filesystem = CABNfs(argv[1], argv[3])
