@@ -320,6 +320,7 @@ class CABNfs(LoggingMixIn, Operations):
         return False
 
     def on_shutdown(self):
+        # TODO
         print('Received shutdown command')
 
     # =================== END LIFECYCLE FUNCTIONS ===================
@@ -636,12 +637,76 @@ class CABNfs(LoggingMixIn, Operations):
                 # Send an empty acknowledgement
                 self.process_reply({}, ch, props)
 
-            elif method.routing_key.endswith('.revoke_lease'):
+            elif method.routing_key.endswith('.revoke_lease'):  # Not needed anymore?
                 file = payload['file']
 
                 # Revoke the lease
                 if file in self.held_leases_dict:
                     self.held_leases_dict.pop(file)
+
+            elif method.routing_key.endswith('.propose_update'):
+                file = payload['file']
+                file_version_sender = payload['version_id']
+                proposed_data = payload['data']
+                proposed_offset = payload['offset']
+
+                # Only process if primary
+                if self.file_primary_map[file] != self.node_name:
+                    self.process_reply({'failure': 'rejection_not_primary'}, ch, props)
+                else:
+                    # Primary will only accept changes to most recent version.
+                    if file_version_sender != self.local_version_id_dict[file]:
+                        self.process_reply({'failure': 'rejection_version_number'}, ch, props)
+                    else:
+                        # Primary needs to send update with an updated version number to all replicas.
+                        replica_write_responses = []
+                        for replica_node in self.file_replica_map[file]:
+                            resp = self.process_request_with_response(
+                                {'file': file, 
+                                'offset': proposed_offset, 
+                                'data': proposed_data, 
+                                'new_version_id': self.local_version_id_dict[file] + 1}, 
+                                'direct', self.get_direct_topic_prefix(replica_node) + 'execute_update', 1)  
+                            replica_write_responses.extend(resp)
+
+                            # Are replica writes are successful?
+                            if len(replica_write_responses) != len(self.file_replica_map[file]):
+                                self.process_reply({'failure': 'rejection_replica_writes'}, ch, props)
+                            else:
+                                # Primary needs to apply change to own copy and update version.
+                                with self.rwlock:
+                                    fh = os.open(self._real_path(file), os.O_RDWR) 
+                                    os.lseek(fh, proposed_offset, 0)
+                                    os.write(fh, proposed_data)  # Do we need str.encode(s) ?
+                                    os.close(fh) 
+                                self.local_version_id_dict[file] = self.local_version_id_dict[file] + 1
+
+                                # Send empty success acknowledgement. 
+                                self.process_reply({}, ch, props)
+
+
+            elif method.routing_key.endswith('.execute_update'):
+                file = payload['file']
+                new_version_id = payload['new_version_id']
+                proposed_data = payload['data']
+                proposed_offset = payload['offset']
+
+                # Make sure sender is primary.
+                if self.file_primary_map[file] == sender:
+
+                    # Write.
+                    with self.rwlock:
+                        fh = os.open(self._real_path(file), os.O_RDWR) 
+                        os.lseek(fh, proposed_offset, 0)
+                        os.write(fh, proposed_data)  # Do we need str.encode(s) ?
+                        os.close(fh) 
+
+                    # Update version.
+                    self.local_version_id_dict[file] = new_version_id
+
+                    # Send empty success acknowledgement. 
+                    self.process_reply({}, ch, props)
+
 
             elif method.routing_key.endswith('.shutdown'):
                 self.on_shutdown()
@@ -746,13 +811,13 @@ class CABNfs(LoggingMixIn, Operations):
             self.promote_to_primary(path)
         return 
 
-    def flush(self, path, fh): # Remove?
+    def flush(self, path, fh): 
         return os.fsync(fh)
 
     def readdir(self, path, fh):
         return ['.', '..'] + self.get_all_files()
 
-    def fsync(self, path, datasync, fh):  # Remove?
+    def fsync(self, path, datasync, fh):  
         if datasync != 0:
             return os.fdatasync(fh)
         else:
@@ -795,9 +860,33 @@ class CABNfs(LoggingMixIn, Operations):
         return
 
     def write(self, path, data, offset, fh):
-        with self.rwlock:
-            os.lseek(fh, offset, 0)
-            return os.write(fh, data)
+        if path[0] == '/':
+            path = path[1:]
+
+        # Get primary.
+        responses = self.process_request_with_response({'file': path}, 'broadcast', 'broadcast.request.primary_status', 1)
+        if len(responses) > 0:
+            primary = responses[0]['sender']
+            # Propose change to primary.
+            res = self.process_request_with_response({'file': path, 'data': data, 'offset': offset, 'version_id': self.local_version_id_dict[path]}, 
+                                                        'direct',
+                                                        self.get_direct_topic_prefix(primary) + 'propose_update', 1)
+            if len(res)==0:
+                # If we didn't get a response. Failure unexplained.
+                logging.warning("ERROR_WRITE_FAIL: " + path)
+                logging.warning("ERROR_WRITE_FAIL_REASON: " + 'unexplained')
+            elif 'failure' in res[0]:
+                # If we are given a failure reason.
+                logging.warning("ERROR_WRITE_FAIL: " + path)
+                logging.warning("ERROR_WRITE_FAIL_REASON: " + res[0]['failure'])
+            else:
+                # Success.
+                logging.warning("WRITE_SUCCESS: " + path)
+                return
+
+        # with self.rwlock:
+        #     os.lseek(fh, offset, 0)
+        #     return os.write(fh, data)
 
     # =================== END FUSE API FUNCTIONS ===================
 
