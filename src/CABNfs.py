@@ -219,10 +219,8 @@ class CABNfs(LoggingMixIn, Operations):
 
             # Case 2, node doesn't have replica and should
             elif not node_has_replica_map[node] and node in desired_replication_nodes:
-
                 # Send the replica
                 if self.replicate_file_to_node(file, node):
-
                     # If succeeded, add as replica holder
                     current_replica_nodes.append(node)
 
@@ -328,25 +326,35 @@ class CABNfs(LoggingMixIn, Operations):
 
     # =================== BEGIN FILE OPERATION HELPER FUNCTIONS ===================
 
-    # TODO
     def process_full_delete(self, file):
-        print('Deleting...')
-        return True
-
         # Check primary status
+        if not (self.file_primary_map[file] == self.node_name):
+            logging.warning("ERROR_NOT_PRIMARY: " + file)  # Should never happen
+        else:
+            # Get the servers that are online
+            ping_responses = self.process_request_with_response({}, 'broadcast', 'broadcast.request.ping',
+                                                self.max_node_count - 1)
+            # Send replica delete requests
+            replica_delete_responses = []
+            for replica_node in [r['sender'] for r in ping_responses]:
+                resp = self.process_request_with_response({'file': file}, 'direct',
+                                                    self.get_direct_topic_prefix(replica_node) + 'delete_file_replica', 1)
+                replica_delete_responses.extend(resp)
 
-        # Send replica delete requests
-
-        # Delete locally
-
-        # Update queues
+            # Delete locally and update queues
+            if len(replica_delete_responses) == self.max_node_count - 1:
+                self.delete_local_file(file)
+                print('Deleting...')
+                return True
+            else:
+                return False
 
     def delete_local_file(self, file):
 
         # Do not delete if file is open.
         if file in self.open_files:
             print('File open!')
-            return
+            return False
 
         del_path = file
         if not file.startswith(self.root):
@@ -355,9 +363,12 @@ class CABNfs(LoggingMixIn, Operations):
         if os.path.exists(del_path):
             os.unlink(del_path)
 
-            # Clean up queue
-            if file in self.local_version_id_dict:
-                self.local_version_id_dict.pop(file)
+        # Clean up queue
+        #if file in self.local_version_id_dict:
+        self.local_version_id_dict.pop(file, None)
+        self.file_replica_map.pop(file, None)
+        self.file_primary_map.pop(file, None)  # Still need to delete even if file is not present.
+        return True
 
     def get_all_files(self):
         responses = self.process_request_with_response({}, 'broadcast', 'broadcast.request.files',
@@ -472,6 +483,10 @@ class CABNfs(LoggingMixIn, Operations):
                 data = {'files': files}
                 self.process_reply(data, channel, props)
 
+            elif method.routing_key == 'broadcast.request.ping':
+                # Send empty reply
+                self.process_reply({}, channel, props)
+
             elif method.routing_key == 'broadcast.request.replica_info':
                 file = payload['file']
 
@@ -575,10 +590,19 @@ class CABNfs(LoggingMixIn, Operations):
                     # Send an empty acknowledgement
                     self.process_reply({}, ch, props)
 
+            elif method.routing_key.endswith('.delete_file_replica'):
+                file = payload['file']
+                if self.delete_local_file(file):
+                    # Send an empty acknowledgement
+                    self.process_reply({}, ch, props)
+
             elif method.routing_key.endswith('.request_replica'):
                 file = payload['file']
                 sender = payload['sender']
-                self.replicate_file_to_node(file, sender)
+                if self.replicate_file_to_node(file, sender):
+                    self.file_replica_map[file].append(sender)
+                    # Send an empty acknowledgement
+                    self.process_reply({}, ch, props)
 
             elif method.routing_key.endswith('.request_lstat'):
                 file = payload['file']
@@ -587,7 +611,6 @@ class CABNfs(LoggingMixIn, Operations):
                                                                     'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size',
                                                                     'st_uid',
                                                                     'st_dev', "st_ino", "st_rdev", "st_blksize", "st_blocks"))
-                print(lst)
                 self.process_reply(lst, ch, props)
 
             elif method.routing_key.endswith('.promote'):
@@ -607,11 +630,11 @@ class CABNfs(LoggingMixIn, Operations):
                 chars_written = handle.write(payload['contents'])
 
                 # Add to map
-                if chars_written > 0:
-                    self.local_version_id_dict[os.path.basename(file)] = payload['version_id']
+                #if chars_written > 0:  # Need to comment this out to work with empty files.
+                self.local_version_id_dict[os.path.basename(file)] = payload['version_id']
 
-                    # Send an empty acknowledgement
-                    self.process_reply({}, ch, props)
+                # Send an empty acknowledgement
+                self.process_reply({}, ch, props)
 
             elif method.routing_key.endswith('.revoke_lease'):
                 file = payload['file']
@@ -653,6 +676,19 @@ class CABNfs(LoggingMixIn, Operations):
     def utimens(self, path, times=None):
         return os.utime(self._real_path(path), times)
 
+    def statfs(self, path):
+        stv = os.statvfs(self._real_path(path))
+        return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
+                                                         'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files',
+                                                         'f_flag',
+                                                         'f_frsize', 'f_namemax'))
+
+    def access(self, path, mode):
+        if not os.access(self._real_path(path), mode):
+            raise FuseOSError(EACCES)
+
+    # Functions with custom logic
+
     def getattr(self, path, fh=None):
         # Do we not have the file?
         if (not os.path.isfile(self._real_path(path))) and (self._real_path(path).split('/')[-1] in self.get_all_files()):
@@ -673,19 +709,6 @@ class CABNfs(LoggingMixIn, Operations):
                                                                     'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size',
                                                                     'st_uid',
                                                                     'st_dev', "st_ino", "st_rdev", "st_blksize", "st_blocks"))
-
-    def statfs(self, path):
-        stv = os.statvfs(self._real_path(path))
-        return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
-                                                         'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files',
-                                                         'f_flag',
-                                                         'f_frsize', 'f_namemax'))
-
-    def access(self, path, mode):
-        if not os.access(self._real_path(path), mode):
-            raise FuseOSError(EACCES)
-
-    # Functions with custom logic
 
     def open(self, path, flags):
         if path[0] == '/':
@@ -723,13 +746,13 @@ class CABNfs(LoggingMixIn, Operations):
             self.promote_to_primary(path)
         return 
 
-    def flush(self, path, fh):
+    def flush(self, path, fh): # Remove?
         return os.fsync(fh)
 
     def readdir(self, path, fh):
         return ['.', '..'] + self.get_all_files()
 
-    def fsync(self, path, datasync, fh):
+    def fsync(self, path, datasync, fh):  # Remove?
         if datasync != 0:
             return os.fdatasync(fh)
         else:
@@ -748,10 +771,10 @@ class CABNfs(LoggingMixIn, Operations):
 
         return os.close(fh)
 
-    def rename(self, old, new):
+    def rename(self, old, new):  # Remove?
         return os.rename(self._real_path(old), self._real_path(new))
 
-    def truncate(self, path, length, fh=None):
+    def truncate(self, path, length, fh=None): # Remove?
         with open(self._real_path(path), 'r+') as f:
             f.truncate(length)
 
