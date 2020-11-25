@@ -16,6 +16,7 @@ import itertools
 import copy
 import shutil
 import operator
+import base64
 
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 
@@ -36,8 +37,8 @@ class CABNfs(LoggingMixIn, Operations):
         self.responses = list()
         self.expecting_responses = False
         self.curr_response_corr_id = None
-        self.requests_timeout = 1.5  # One second more than TTL
-        self.requests_ttl = '500'
+        self.requests_timeout = 2.0  # One second more than TTL
+        self.requests_ttl = '1000' 
 
         # Needed queues
         self.broadcast_queuename = "broadcast_queue_" + self.node_name
@@ -677,12 +678,16 @@ class CABNfs(LoggingMixIn, Operations):
                                 with self.rwlock:
                                     fh = os.open(self._real_path(file), os.O_RDWR) 
                                     os.lseek(fh, proposed_offset, 0)
-                                    os.write(fh, proposed_data)  # Do we need str.encode(s) ?
+                                    proposed_data = base64.b64decode(proposed_data)  # Decode to write.
+                                    os.write(fh, proposed_data)
                                     os.close(fh) 
+
                                 self.local_version_id_dict[file] = self.local_version_id_dict[file] + 1
 
                                 # Send empty success acknowledgement. 
-                                self.process_reply({}, ch, props)
+                                self.process_reply({'status':'success'}, ch, props)  # This doesn't seem to be sending anything...
+
+                                print('Written on primary.')
 
 
             elif method.routing_key.endswith('.execute_update'):
@@ -698,7 +703,8 @@ class CABNfs(LoggingMixIn, Operations):
                     with self.rwlock:
                         fh = os.open(self._real_path(file), os.O_RDWR) 
                         os.lseek(fh, proposed_offset, 0)
-                        os.write(fh, proposed_data)  # Do we need str.encode(s) ?
+                        proposed_data = base64.b64decode(proposed_data)  # Decode to write.
+                        os.write(fh, proposed_data)  
                         os.close(fh) 
 
                     # Update version.
@@ -706,6 +712,8 @@ class CABNfs(LoggingMixIn, Operations):
 
                     # Send empty success acknowledgement. 
                     self.process_reply({}, ch, props)
+
+                    print('Written on replica.')
 
 
             elif method.routing_key.endswith('.shutdown'):
@@ -804,12 +812,13 @@ class CABNfs(LoggingMixIn, Operations):
             logging.warning("ERROR_FILE_EXISTS: " + path)
         else:
             # Create the file locally.
-            os.open(self._real_path(path), os.O_WRONLY | os.O_CREAT, mode)
+            self.open_files.append(path)  # To prevent a rebalance delete.
+            res = os.open(self._real_path(path), os.O_WRONLY | os.O_CREAT, mode)
             # Set version ID.
             self.local_version_id_dict[path] = 1
             # Mark as primary and create replicas.
             self.promote_to_primary(path)
-        return 
+            return res
 
     def flush(self, path, fh): 
         return os.fsync(fh)
@@ -863,30 +872,39 @@ class CABNfs(LoggingMixIn, Operations):
         if path[0] == '/':
             path = path[1:]
 
+        # Encode the data bytes for serialization.
+        data = base64.b64encode(data) 
+        data = data.decode('ascii')
+
         # Get primary.
-        responses = self.process_request_with_response({'file': path}, 'broadcast', 'broadcast.request.primary_status', 1)
+        if self.file_primary_map[path] == self.node_name:
+            responses = [{'sender': self.node_name}]
+        else:
+            responses = self.process_request_with_response({'file': path}, 'broadcast', 'broadcast.request.primary_status', 1)
         if len(responses) > 0:
             primary = responses[0]['sender']
             # Propose change to primary.
             res = self.process_request_with_response({'file': path, 'data': data, 'offset': offset, 'version_id': self.local_version_id_dict[path]}, 
                                                         'direct',
                                                         self.get_direct_topic_prefix(primary) + 'propose_update', 1)
+            
+            logging.warning("3+++++++++++"+str(res))
+            
             if len(res)==0:
                 # If we didn't get a response. Failure unexplained.
                 logging.warning("ERROR_WRITE_FAIL: " + path)
                 logging.warning("ERROR_WRITE_FAIL_REASON: " + 'unexplained')
+                return
             elif 'failure' in res[0]:
                 # If we are given a failure reason.
                 logging.warning("ERROR_WRITE_FAIL: " + path)
                 logging.warning("ERROR_WRITE_FAIL_REASON: " + res[0]['failure'])
+                return
             else:
                 # Success.
                 logging.warning("WRITE_SUCCESS: " + path)
-                return
+                return 
 
-        # with self.rwlock:
-        #     os.lseek(fh, offset, 0)
-        #     return os.write(fh, data)
 
     # =================== END FUSE API FUNCTIONS ===================
 
