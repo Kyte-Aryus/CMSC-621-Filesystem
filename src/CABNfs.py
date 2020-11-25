@@ -887,14 +887,15 @@ class CABNfs(LoggingMixIn, Operations):
             res = self.process_request_with_response({'file': path, 'data': data, 'offset': offset, 'version_id': self.local_version_id_dict[path]}, 
                                                         'direct',
                                                         self.get_direct_topic_prefix(primary) + 'propose_update', 1)
+            # Use for testing conflicting writes: 'version_id': self.local_version_id_dict[path]-1
             
             logging.warning("3+++++++++++"+str(res))
             
             if len(res)==0:
                 # If we didn't get a response. Failure unexplained.
                 logging.warning("ERROR_WRITE_FAIL: " + path)
-                logging.warning("ERROR_WRITE_FAIL_REASON: " + 'unexplained')
-                return
+                logging.warning("ERROR_WRITE_FAIL_REASON: " + 'no response')  # For now this is not actually an error.
+                return  
             elif 'failure' in res[0]:
                 # If we are given a failure reason.
                 logging.warning("ERROR_WRITE_FAIL: " + path)
