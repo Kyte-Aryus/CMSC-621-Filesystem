@@ -63,6 +63,9 @@ class CABNfs(LoggingMixIn, Operations):
         # To prevent a rebalance delete
         self.open_files = []
 
+        # Track primary write history for merges.
+        self.write_history = {}  # file -> version_id -> [start, end]
+
         # Define file and status tracking
         self.current_node_alive_count = 1
         self.file_replica_map = dict()  # Only relevent if we're primary
@@ -655,10 +658,58 @@ class CABNfs(LoggingMixIn, Operations):
                 if self.file_primary_map[file] != self.node_name:
                     self.process_reply({'failure': 'rejection_not_primary'}, ch, props)
                 else:
-                    # Primary will only accept changes to most recent version.
-                    if file_version_sender != self.local_version_id_dict[file]:
+
+                    # Manage merges and conflicts.
+                    conflict = False
+                    with self.rwlock:
+                        # Proposed start and end of update.
+                        proposed_start = proposed_offset
+                        if proposed_data == 0:  # If truncation.
+                            proposed_end = -1
+                        else:
+                            proposed_end = proposed_start + len(base64.b64decode(proposed_data))
+
+                        # Check for higher versions.
+                        max_version = self.local_version_id_dict[file]
+                        if file in self.write_history:
+                            higher_versions = [v for v in self.write_history[file].keys() if v > file_version_sender]
+                            if len(higher_versions) > 0:
+                                max_version = max(max_version,max(higher_versions))
+                            for v in higher_versions:
+                                if proposed_end == -1:  # If we are truncating.
+                                    if self.write_history[file][v][1] == -1:  # If there was a truncate.
+                                        if proposed_start > self.write_history[file][v][0]:
+                                            conflict = True
+                                            break
+                                    else:
+                                        if proposed_start < self.write_history[file][v][1]:
+                                            conflict = True
+                                            break
+
+                                else:
+                                    if self.write_history[file][v][1] == -1:  # If there was a truncate.
+                                        if proposed_end > self.write_history[file][v][0]:
+                                            conflict = True
+                                            break
+                                    else:
+                                        if (proposed_start < self.write_history[file][v][1]) and (self.write_history[file][v][0] < proposed_end):
+                                            conflict = True
+                                            break
+                        
+                        # If no conflict, assign a new version id for the write and log a write (deleted if unsuccessful later).
+                        if not conflict:
+                            proposed_version_id = max_version + 1
+                            if file not in self.write_history:
+                                self.write_history[file] = {}
+                            self.write_history[file][proposed_version_id] = [proposed_start, proposed_end]
+
+                    # If no conflict, continue writing.
+                    if conflict:
                         self.process_reply({'failure': 'rejection_version_number'}, ch, props)
+                        print('Conflict!')
+
                     else:
+
                         # Primary needs to send update with an updated version number to all replicas.
                         replica_write_responses = []
                         replica_write_expected_responses = len(self.file_replica_map[file])
@@ -672,15 +723,16 @@ class CABNfs(LoggingMixIn, Operations):
                                 {'file': file, 
                                 'offset': proposed_offset, 
                                 'data': proposed_data, 
-                                'new_version_id': self.local_version_id_dict[file] + 1}, 
+                                'new_version_id': proposed_version_id}, 
                                 'direct', self.get_direct_topic_prefix(replica_node) + 'execute_update', 1)  
                             replica_write_responses.extend(resp)
 
                         # Are replica writes are successful?
                         if len(replica_write_responses) != replica_write_expected_responses:
                             self.process_reply({'failure': 'rejection_replica_writes'}, ch, props)
+                            # If fail, undo the proposed write in the history.
+                            self.write_history[file].pop(proposed_version_id, None)
                         else:
-                            # Keep in this order for getattr to work.
 
                             # Send confirm to proposer, if proposer not self.
                             if sender != self.node_name:
@@ -688,7 +740,7 @@ class CABNfs(LoggingMixIn, Operations):
                                     {'file': file, 
                                     'offset': proposed_offset, 
                                     'data': proposed_data, 
-                                    'new_version_id': self.local_version_id_dict[file] + 1}, 
+                                    'new_version_id': proposed_version_id}, 
                                     'direct', self.get_direct_topic_prefix(sender) + 'execute_update', 1) 
 
                             # Primary needs to apply change to own copy and update version.
@@ -707,7 +759,7 @@ class CABNfs(LoggingMixIn, Operations):
                                     os.close(fh) 
 
                             # Update local version id.
-                            self.local_version_id_dict[file] = self.local_version_id_dict[file] + 1
+                            self.local_version_id_dict[file] = proposed_version_id
 
                             print('Written on primary.')
 
@@ -921,7 +973,7 @@ class CABNfs(LoggingMixIn, Operations):
             path = path[1:]
 
         # To allow time for truncation if needed.
-        time.sleep(1)
+        time.sleep(2)
 
         # For returning.
         data_length = len(data)
