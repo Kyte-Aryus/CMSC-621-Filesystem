@@ -1,5 +1,5 @@
 # Set base image to RabbitMQ.
-FROM rabbitmq:3
+FROM rabbitmq:3.8.8
 
 MAINTAINER Andre Nguyen, Christian Badolato
 
@@ -28,4 +28,5 @@ WORKDIR /app
 COPY rabbitmq.conf /etc/rabbitmq/
 
 # Start RabbitMQ server and run Fuse filesystem on container start.
-CMD ["sh", "-c", "chmod +x ./start.sh && ./start.sh"]
+#CMD ["sh", "-c", "chmod +x ./start.sh && ./start.sh"]
+CMD ["tail", "-f", "/dev/null"]
