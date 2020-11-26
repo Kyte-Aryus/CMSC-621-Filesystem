@@ -661,7 +661,13 @@ class CABNfs(LoggingMixIn, Operations):
                     else:
                         # Primary needs to send update with an updated version number to all replicas.
                         replica_write_responses = []
+                        replica_write_expected_responses = len(self.file_replica_map[file])
                         for replica_node in self.file_replica_map[file]:
+
+                            if replica_node == sender:
+                                replica_write_expected_responses = max(0, replica_write_expected_responses - 1)
+                                continue  # We update the proposer last as a confirm, if it is a replica.
+
                             resp = self.process_request_with_response(
                                 {'file': file, 
                                 'offset': proposed_offset, 
@@ -670,24 +676,36 @@ class CABNfs(LoggingMixIn, Operations):
                                 'direct', self.get_direct_topic_prefix(replica_node) + 'execute_update', 1)  
                             replica_write_responses.extend(resp)
 
-                            # Are replica writes are successful?
-                            if len(replica_write_responses) != len(self.file_replica_map[file]):
-                                self.process_reply({'failure': 'rejection_replica_writes'}, ch, props)
-                            else:
-                                # Primary needs to apply change to own copy and update version.
-                                with self.rwlock:
-                                    fh = os.open(self._real_path(file), os.O_RDWR) 
-                                    os.lseek(fh, proposed_offset, 0)
-                                    proposed_data = base64.b64decode(proposed_data)  # Decode to write.
-                                    os.write(fh, proposed_data)
-                                    os.close(fh) 
+                        # Are replica writes are successful?
+                        if len(replica_write_responses) != replica_write_expected_responses:
+                            self.process_reply({'failure': 'rejection_replica_writes'}, ch, props)
+                        else:
+                            # Keep in this order for getattr to work.
 
-                                self.local_version_id_dict[file] = self.local_version_id_dict[file] + 1
+                            # Send confirm to proposer, if proposer not self.
+                            if sender != self.node_name:
+                                _ = self.process_request_with_response(
+                                    {'file': file, 
+                                    'offset': proposed_offset, 
+                                    'data': proposed_data, 
+                                    'new_version_id': self.local_version_id_dict[file] + 1}, 
+                                    'direct', self.get_direct_topic_prefix(sender) + 'execute_update', 1) 
 
-                                # Send empty success acknowledgement. 
-                                self.process_reply({'status':'success'}, ch, props)  # This doesn't seem to be sending anything...
+                            # Primary needs to apply change to own copy and update version.
+                            with self.rwlock:
+                                fh = os.open(self._real_path(file), os.O_RDWR) 
+                                os.lseek(fh, proposed_offset, 0)
+                                os.write(fh, base64.b64decode(proposed_data))  # Decode to write.
+                                os.close(fh) 
 
-                                print('Written on primary.')
+                            # Update local version id.
+                            self.local_version_id_dict[file] = self.local_version_id_dict[file] + 1
+
+                            print('Written on primary.')
+                            print(len(base64.b64decode(proposed_data)))
+                            print(base64.b64decode(proposed_data))
+
+                            
 
 
             elif method.routing_key.endswith('.execute_update'):
@@ -706,6 +724,9 @@ class CABNfs(LoggingMixIn, Operations):
                         proposed_data = base64.b64decode(proposed_data)  # Decode to write.
                         os.write(fh, proposed_data)  
                         os.close(fh) 
+
+                        print(len(proposed_data))
+                        print(proposed_data)
 
                     # Update version.
                     self.local_version_id_dict[file] = new_version_id
@@ -872,6 +893,12 @@ class CABNfs(LoggingMixIn, Operations):
         if path[0] == '/':
             path = path[1:]
 
+        # For returning.
+        data_length = len(data)
+
+        # Strip the echo new line.
+        data = data.strip(b'\n')
+
         # Encode the data bytes for serialization.
         data = base64.b64encode(data) 
         data = data.decode('ascii')
@@ -888,23 +915,15 @@ class CABNfs(LoggingMixIn, Operations):
                                                         'direct',
                                                         self.get_direct_topic_prefix(primary) + 'propose_update', 1)
             # Use for testing conflicting writes: 'version_id': self.local_version_id_dict[path]-1
-            
-            logging.warning("3+++++++++++"+str(res))
-            
-            if len(res)==0:
-                # If we didn't get a response. Failure unexplained.
-                logging.warning("ERROR_WRITE_FAIL: " + path)
-                logging.warning("ERROR_WRITE_FAIL_REASON: " + 'no response')  # For now this is not actually an error.
-                return  
-            elif 'failure' in res[0]:
-                # If we are given a failure reason.
+
+            if (len(res)>0) and ('failure' in res[0]):
+                # If we are given a failure message.
+                # Client knows write was a success if the primary sends it a write order.
                 logging.warning("ERROR_WRITE_FAIL: " + path)
                 logging.warning("ERROR_WRITE_FAIL_REASON: " + res[0]['failure'])
-                return
-            else:
-                # Success.
-                logging.warning("WRITE_SUCCESS: " + path)
-                return 
+                return 0
+
+            return data_length
 
 
     # =================== END FUSE API FUNCTIONS ===================
