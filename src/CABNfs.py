@@ -648,8 +648,8 @@ class CABNfs(LoggingMixIn, Operations):
             elif method.routing_key.endswith('.propose_update'):
                 file = payload['file']
                 file_version_sender = payload['version_id']
-                proposed_data = payload['data']
-                proposed_offset = payload['offset']
+                proposed_data = payload['data']  # If data is 0, we are truncating. 
+                proposed_offset = payload['offset']  # If data is 0, truncation length.
 
                 # Only process if primary
                 if self.file_primary_map[file] != self.node_name:
@@ -692,22 +692,26 @@ class CABNfs(LoggingMixIn, Operations):
                                     'direct', self.get_direct_topic_prefix(sender) + 'execute_update', 1) 
 
                             # Primary needs to apply change to own copy and update version.
-                            with self.rwlock:
-                                fh = os.open(self._real_path(file), os.O_RDWR) 
-                                os.lseek(fh, proposed_offset, 0)
-                                os.write(fh, base64.b64decode(proposed_data))  # Decode to write.
-                                os.close(fh) 
+                            
+                            # Truncation.
+                            if proposed_data == 0:
+                                with open(self._real_path(file), 'r+') as f:
+                                    f.truncate(proposed_offset)
+
+                            # Write.
+                            else:
+                                with self.rwlock:
+                                    fh = os.open(self._real_path(file), os.O_RDWR) 
+                                    os.lseek(fh, proposed_offset, 0)
+                                    os.write(fh, base64.b64decode(proposed_data))  # Decode to write.
+                                    os.close(fh) 
 
                             # Update local version id.
                             self.local_version_id_dict[file] = self.local_version_id_dict[file] + 1
 
                             print('Written on primary.')
-                            print(len(base64.b64decode(proposed_data)))
-                            print(base64.b64decode(proposed_data))
 
                             
-
-
             elif method.routing_key.endswith('.execute_update'):
                 file = payload['file']
                 new_version_id = payload['new_version_id']
@@ -717,16 +721,19 @@ class CABNfs(LoggingMixIn, Operations):
                 # Make sure sender is primary.
                 if self.file_primary_map[file] == sender:
 
-                    # Write.
-                    with self.rwlock:
-                        fh = os.open(self._real_path(file), os.O_RDWR) 
-                        os.lseek(fh, proposed_offset, 0)
-                        proposed_data = base64.b64decode(proposed_data)  # Decode to write.
-                        os.write(fh, proposed_data)  
-                        os.close(fh) 
+                    # Truncation.
+                    if proposed_data == 0:
+                        with open(self._real_path(file), 'r+') as f:
+                            f.truncate(proposed_offset)
 
-                        print(len(proposed_data))
-                        print(proposed_data)
+                    # Write.
+                    else:
+                        with self.rwlock:
+                            fh = os.open(self._real_path(file), os.O_RDWR) 
+                            os.lseek(fh, proposed_offset, 0)
+                            proposed_data = base64.b64decode(proposed_data)  # Decode to write.
+                            os.write(fh, proposed_data)  
+                            os.close(fh) 
 
                     # Update version.
                     self.local_version_id_dict[file] = new_version_id
@@ -869,9 +876,29 @@ class CABNfs(LoggingMixIn, Operations):
     def rename(self, old, new):  # Remove?
         return os.rename(self._real_path(old), self._real_path(new))
 
-    def truncate(self, path, length, fh=None): # Remove?
-        with open(self._real_path(path), 'r+') as f:
-            f.truncate(length)
+    def truncate(self, path, length, fh=None): 
+        if path[0] == '/':
+            path = path[1:]
+
+        # Get primary.
+        if self.file_primary_map[path] == self.node_name:
+            responses = [{'sender': self.node_name}]
+        else:
+            responses = self.process_request_with_response({'file': path}, 'broadcast', 'broadcast.request.primary_status', 1)
+        if len(responses) > 0:
+            primary = responses[0]['sender']
+            # Propose change to primary.
+            res = self.process_request_with_response({'file': path, 'data': 0, 'offset': length, 'version_id': self.local_version_id_dict[path]}, 
+                                                        'direct',
+                                                        self.get_direct_topic_prefix(primary) + 'propose_update', 1)
+            # Use for testing conflicting writes: 'version_id': self.local_version_id_dict[path]-1
+
+            if (len(res)>0) and ('failure' in res[0]):
+                # If we are given a failure message.
+                # Client knows write was a success if the primary sends it a write order.
+                logging.warning("ERROR_TRUNC_FAIL: " + path)
+                logging.warning("ERROR_TRUNC_FAIL_REASON: " + res[0]['failure'])
+
 
     def unlink(self, path):   
         if path[0] == '/':
@@ -892,6 +919,9 @@ class CABNfs(LoggingMixIn, Operations):
     def write(self, path, data, offset, fh):
         if path[0] == '/':
             path = path[1:]
+
+        # To allow time for truncation if needed.
+        time.sleep(1)
 
         # For returning.
         data_length = len(data)
