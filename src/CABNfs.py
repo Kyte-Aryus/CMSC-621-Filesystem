@@ -6,7 +6,6 @@ from errno import EACCES
 from sys import argv, exit
 import logging
 import threading
-import os.path
 import json
 import pika
 import os
@@ -17,6 +16,8 @@ import copy
 import shutil
 import operator
 import base64
+import random
+import signal
 
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 
@@ -25,20 +26,23 @@ class CABNfs(LoggingMixIn, Operations):
 
     def __init__(self, root, replication_factor):
 
+        print("---- BEGIN STARTUP ----")
+
         # Structural setup
         self.replication_factor = int(replication_factor)
         self.root = os.path.realpath(root)
         self.rwlock = threading.Lock()
         self.messaging_lock = threading.Lock()
         self.max_node_count = int(os.environ['NODE_COUNT'])
+        self.shutting_down = False
 
         # Rabbitmq setup
         self.node_name = os.environ['RABBITMQ_NODENAME']
         self.responses = list()
         self.expecting_responses = False
         self.curr_response_corr_id = None
-        self.requests_timeout = 2.0  # One second more than TTL
-        self.requests_ttl = '1000' 
+        self.requests_timeout = 1.5  # One second more than TTL
+        self.requests_ttl = '500'
 
         # Needed queues
         self.broadcast_queuename = "broadcast_queue_" + self.node_name
@@ -60,6 +64,9 @@ class CABNfs(LoggingMixIn, Operations):
         direct_listening_thread = threading.Thread(target=self.direct_listening_thread_function, daemon=True)
         direct_listening_thread.start()
 
+        # Give time for channels to start
+        time.sleep(1)
+
         # To prevent a rebalance delete
         self.open_files = []
 
@@ -67,12 +74,9 @@ class CABNfs(LoggingMixIn, Operations):
         self.write_history = {}  # file -> version_id -> [start, end]
 
         # Define file and status tracking
-        self.current_node_alive_count = 1
         self.file_replica_map = dict()  # Only relevent if we're primary
         self.file_primary_map = dict()
         self.local_version_id_dict = dict()
-        self.given_leases_dict = dict()  # Lease can only if we're the primary for the file
-        self.held_leases_dict = dict()  # Strictly for writing
 
         # Open the versionID file and load
         self.version_file_path = os.environ['VERSION_ID_FILE']
@@ -88,11 +92,12 @@ class CABNfs(LoggingMixIn, Operations):
             # If local file doesn't have a version ID, make it one
             # Note that this indicates an inconsistency and should never happen
             if file not in self.local_version_id_dict:
-                logging.warning("Version ID not found for file: " + file)
+                print("WARNING: Version ID not found for file: " + file)
                 self.local_version_id_dict[file] = 1
 
-        print("Local files")
+        print("Files present locally with version number:")
         print(self.local_version_id_dict)
+        print("")
 
         # Request all files in the system
         responses = self.process_request_with_response({}, 'broadcast', 'broadcast.request.files',
@@ -101,10 +106,7 @@ class CABNfs(LoggingMixIn, Operations):
         for response in responses:
             files = response['files']
             for file in files:
-
                 primary = files[file]
-
-                print("File: " + file + " - Primary: " + primary)
 
                 # If it's the first time we've seen this file or we don't know it's primary
                 if file not in self.file_primary_map or self.file_primary_map[file] is None:
@@ -117,8 +119,9 @@ class CABNfs(LoggingMixIn, Operations):
             if file not in self.file_primary_map:
                 self.file_primary_map[file] = None
 
-        print("All files")
+        print("All files in system mapped to primary servers (before attempts at promoting this node):")
         print(self.file_primary_map)
+        print("")
 
         # self.file_primary_map now contains all files,
         # for each file we own that doesn't have a primary, promote this node
@@ -126,12 +129,20 @@ class CABNfs(LoggingMixIn, Operations):
             if self.file_primary_map[file] is None:
                 self.promote_to_primary(file)
 
+        print("All files in system mapped to primary servers:")
         print(self.file_primary_map)
+        print("")
 
         # At this point, all primaries for all files should be known
         for file in self.file_primary_map:
             if self.file_primary_map[file] is None:
                 print("WARNING: Unknown primary for file " + file + " at startup")
+
+        # Let other servers know this node has joined for replication purposes
+        self.process_request({}, 'broadcast', 'broadcast.update.node_joined')
+
+        print("---- STARTUP COMPLETE ----")
+        print("---- NODE ONLINE ----")
 
     # =================== BEGIN UTILITY FUNCTIONS ===================
 
@@ -181,7 +192,11 @@ class CABNfs(LoggingMixIn, Operations):
         if file not in self.file_primary_map or self.file_primary_map[file] != self.node_name:
             return
 
-        print("Balancing " + file)
+        print("REDISTRIBUTING replicas for " + file)
+        print("")
+
+        # Clean replica map
+        self.file_replica_map[file] = list()
 
         # Request replica existence and disk space from other nodes
         data = {'file': file}
@@ -204,7 +219,7 @@ class CABNfs(LoggingMixIn, Operations):
                                                          reverse=True)}
         desired_replication_nodes = dict(itertools.islice(node_to_disk_free_map.items(), self.replication_factor - 1))
 
-        print("Desired replication nodes for " + file + " - " + str(desired_replication_nodes))
+        print("DESIRED REPLICATION nodes for " + file + " - " + str(desired_replication_nodes))
 
         # Now loop through each node that responded and determine what to do
         for node in node_has_replica_map:
@@ -212,10 +227,13 @@ class CABNfs(LoggingMixIn, Operations):
             # Case 1, node has replica and shouldn't
             if node_has_replica_map[node] and node not in desired_replication_nodes:
 
+                print("DELETING replica on " + node)
+
                 # Tell it to delete the file
                 data = {'file': file}
                 response = self.process_request_with_response(data, 'direct',
-                                                              self.get_direct_topic_prefix(node) + 'delete_replica', 1)
+                                                              self.get_direct_topic_prefix(node) + 'delete_file_replica'
+                                                              , 1)
 
                 # If succeeded, remove as replica holder
                 if len(response) != 0:
@@ -223,6 +241,7 @@ class CABNfs(LoggingMixIn, Operations):
 
             # Case 2, node doesn't have replica and should
             elif not node_has_replica_map[node] and node in desired_replication_nodes:
+
                 # Send the replica
                 if self.replicate_file_to_node(file, node):
                     # If succeeded, add as replica holder
@@ -232,6 +251,10 @@ class CABNfs(LoggingMixIn, Operations):
 
         # Finally, make sure the replica map is up to date
         self.file_replica_map[file] = current_replica_nodes
+
+        print("Current replicas for " + file + ": ")
+        print(self.file_replica_map[file])
+        print("")
 
         # Note that we don't care how many replicas are actually created here, this is a 'best-effort' algorithm
         # without strong guarantees. Due to the nature of the algorithm, all replicas must be consistent
@@ -280,7 +303,7 @@ class CABNfs(LoggingMixIn, Operations):
         if file not in self.local_version_id_dict:
             return
 
-        print("Promote to Primary for " + file)
+        print("PROMOTING to Primary for " + file)
 
         # Notify all nodes of new primary
         data = {'file': file}
@@ -296,15 +319,13 @@ class CABNfs(LoggingMixIn, Operations):
 
         # Only primary can request a replicate
         if self.file_primary_map[file] != self.node_name:
-            print("NOT PRIMARY")
             return
 
         # Can only replicate if we have a local copy
         if file not in self.local_version_id_dict:
-            print("NOT LOCAL")
             return
 
-        print("Attempting to replicate " + file + " on " + node)
+        print("REPLICATING on " + node)
 
         # Fetch file
         if not file.startswith(self.root):
@@ -324,8 +345,42 @@ class CABNfs(LoggingMixIn, Operations):
         return False
 
     def on_shutdown(self):
-        # TODO
-        print('Received shutdown command')
+
+        print("---- BEGIN SHUTDOWN ----")
+
+        # Stop message processing for everything but promote
+        self.shutting_down = True
+
+        # Pick another node to promote to primary for each file
+        for file in self.file_replica_map:
+
+            # Randomize who gets promoted
+            server_list = self.file_replica_map[file][:]
+            random.shuffle(server_list)
+
+            # Try until one succeeds
+            found = False
+            for server in server_list:
+                print("PROMOTING REMOTE node " + server + " to primary for " + file)
+                data = {'file': file}
+                response = self.process_request_with_response(data, 'direct',
+                                                              self.get_direct_topic_prefix(server) + 'promote',
+                                                              1)
+                if len(response) > 0:
+                    found = True
+                    break
+
+            # Print error if no primary
+            if not found:
+                print("WARNING: No primary acknowledgement for " + file + ". File may be unavailable")
+
+        # Note that if no other server has a replica for a file, we assume
+        # this node is the last alive, therefore we can do a normal shutdown
+        # Without checking
+
+        # Perform shutdown
+        print("---- SHUTDOWN COMPLETE----\n")
+        os.kill(os.getpid(), signal.SIGINT)
 
     # =================== END LIFECYCLE FUNCTIONS ===================
 
@@ -334,7 +389,7 @@ class CABNfs(LoggingMixIn, Operations):
     def process_full_delete(self, file):
         # Check primary status
         if not (self.file_primary_map[file] == self.node_name):
-            logging.warning("ERROR_NOT_PRIMARY: " + file)  # Should never happen
+            print("ERROR_NOT_PRIMARY: " + file)  # Should never happen
         else:
             # Get the servers that are online
             ping_responses = self.process_request_with_response({}, 'broadcast', 'broadcast.request.ping',
@@ -349,7 +404,6 @@ class CABNfs(LoggingMixIn, Operations):
             # Delete locally and update queues
             if len(replica_delete_responses) == self.max_node_count - 1:
                 self.delete_local_file(file)
-                print('Deleting...')
                 return True
             else:
                 return False
@@ -358,8 +412,10 @@ class CABNfs(LoggingMixIn, Operations):
 
         # Do not delete if file is open.
         if file in self.open_files:
-            print('File open!')
+            print("WARNING: Could not delete " + file + " - File open!")
             return False
+
+        print("DELETING " + file)
 
         del_path = file
         if not file.startswith(self.root):
@@ -369,7 +425,6 @@ class CABNfs(LoggingMixIn, Operations):
             os.unlink(del_path)
 
         # Clean up queue
-        #if file in self.local_version_id_dict:
         self.local_version_id_dict.pop(file, None)
         self.file_replica_map.pop(file, None)
         self.file_primary_map.pop(file, None)  # Still need to delete even if file is not present.
@@ -391,6 +446,10 @@ class CABNfs(LoggingMixIn, Operations):
     # Returns after timeout or when max_responses are recieved
     # Note that this method returns the responses to preserve thread safety
     def process_request_with_response(self, data, exchange, topic, max_responses):
+
+        # Only one message allowed during shutdown
+        if self.shutting_down and not topic.endswith("promote"):
+            return
 
         # Ensure only one request is processed at a time
         with self.messaging_lock:
@@ -414,6 +473,7 @@ class CABNfs(LoggingMixIn, Operations):
 
             print("Responses for: " + topic)
             print(return_dict)
+            print("")
 
             return return_dict
 
@@ -424,7 +484,7 @@ class CABNfs(LoggingMixIn, Operations):
         # Messages must always have a sender, this just enforces that
         data['sender'] = self.node_name
 
-        print("Sending " + topic + " to " + exchange)
+        print("SENDING " + topic)
 
         self.rabbitmq_main_channel.basic_publish(
             exchange=exchange,
@@ -439,6 +499,10 @@ class CABNfs(LoggingMixIn, Operations):
     # Sends reply
     def process_reply(self, data, channel, props):
 
+        # Don't reply if we're shutting down
+        if self.shutting_down:
+            return
+
         # Messages must always have a sender, this just enforces that
         data['sender'] = self.node_name
 
@@ -447,7 +511,6 @@ class CABNfs(LoggingMixIn, Operations):
                               properties=pika.BasicProperties(correlation_id=props.correlation_id,
                                                               expiration=self.requests_ttl),
                               body=json.dumps(data))
-
 
     # Thread function which handles listening for broadcast messages
     def broadcast_listening_thread_function(self):
@@ -471,7 +534,7 @@ class CABNfs(LoggingMixIn, Operations):
             payload = json.loads(body)
             sender = payload['sender']
 
-            print("Got request for " + method.routing_key)
+            print("RECEIVED broadcast " + method.routing_key + " from " + sender)
 
             if method.routing_key == 'broadcast.request.files':
 
@@ -520,16 +583,27 @@ class CABNfs(LoggingMixIn, Operations):
                 self.file_primary_map[file] = sender
 
                 # We can stop keeping track of replicas
-                self.file_replica_map = dict()
+                if file in self.file_replica_map:
+                    self.file_replica_map[file] = list()
 
-                # Release given leases
-                for lease in self.given_leases_dict:
-                    print("Remove")
+            elif method.routing_key == 'broadcast.update.node_joined':
 
-                    #TODO
-                    # Send direct.node.revoke_lease message to each lease holder
+                print("DETECTED NODE " + sender)
 
-                self.given_leases_dict = dict()
+                # For every file we primary, if we don't have enough replicas,
+                # replicate on the new server
+                for file in self.file_replica_map:
+
+                    if len(self.file_replica_map[file]) < self.replication_factor - 1\
+                            and sender not in self.file_replica_map[file]:
+
+                        print("Insufficient replicas for file " + file)
+
+                        # Attempt to replicate
+                        if self.replicate_file_to_node(file, sender):
+
+                            # If succeeded, add as replica holder
+                            self.file_replica_map[file].append(sender)
 
             else:
                 logging.info('Unhandled broadcast message received')
@@ -582,7 +656,7 @@ class CABNfs(LoggingMixIn, Operations):
             payload = json.loads(body)
             sender = payload['sender']
 
-            print("Got direct message of type " + method.routing_key)
+            print("RECEIVED direct message " + method.routing_key + " from " + sender)
 
             # Delete requests
             if method.routing_key.endswith('.delete_file'):
@@ -623,6 +697,11 @@ class CABNfs(LoggingMixIn, Operations):
 
                 # Verify the request came from the primary
                 if self.file_primary_map[file] == sender:
+
+                    # Send an empty acknowledgement
+                    self.process_reply({}, ch, props)
+
+                    # Processes
                     self.promote_to_primary(file)
 
             elif method.routing_key.endswith('.replicate'):
@@ -635,18 +714,10 @@ class CABNfs(LoggingMixIn, Operations):
                 chars_written = handle.write(payload['contents'])
 
                 # Add to map
-                #if chars_written > 0:  # Need to comment this out to work with empty files.
                 self.local_version_id_dict[os.path.basename(file)] = payload['version_id']
 
                 # Send an empty acknowledgement
                 self.process_reply({}, ch, props)
-
-            elif method.routing_key.endswith('.revoke_lease'):  # Not needed anymore?
-                file = payload['file']
-
-                # Revoke the lease
-                if file in self.held_leases_dict:
-                    self.held_leases_dict.pop(file)
 
             elif method.routing_key.endswith('.propose_update'):
                 file = payload['file']
@@ -706,7 +777,7 @@ class CABNfs(LoggingMixIn, Operations):
                     # If no conflict, continue writing.
                     if conflict:
                         self.process_reply({'failure': 'rejection_version_number'}, ch, props)
-                        print('Conflict!')
+                        print("WARNING: Conflict on " + file + " - Could not write!")
 
                     else:
 
@@ -721,10 +792,10 @@ class CABNfs(LoggingMixIn, Operations):
 
                             resp = self.process_request_with_response(
                                 {'file': file, 
-                                'offset': proposed_offset, 
-                                'data': proposed_data, 
-                                'new_version_id': proposed_version_id}, 
-                                'direct', self.get_direct_topic_prefix(replica_node) + 'execute_update', 1)  
+                                 'offset': proposed_offset,
+                                 'data': proposed_data,
+                                 'new_version_id': proposed_version_id},
+                                'direct', self.get_direct_topic_prefix(replica_node) + 'execute_update', 1)
                             replica_write_responses.extend(resp)
 
                         # Are replica writes are successful?
@@ -738,9 +809,9 @@ class CABNfs(LoggingMixIn, Operations):
                             if sender != self.node_name:
                                 _ = self.process_request_with_response(
                                     {'file': file, 
-                                    'offset': proposed_offset, 
-                                    'data': proposed_data, 
-                                    'new_version_id': proposed_version_id}, 
+                                     'offset': proposed_offset,
+                                     'data': proposed_data,
+                                     'new_version_id': proposed_version_id},
                                     'direct', self.get_direct_topic_prefix(sender) + 'execute_update', 1) 
 
                             # Primary needs to apply change to own copy and update version.
@@ -761,9 +832,8 @@ class CABNfs(LoggingMixIn, Operations):
                             # Update local version id.
                             self.local_version_id_dict[file] = proposed_version_id
 
-                            print('Written on primary.')
+                            print("WROTE file " + file + " on primary node " + self.node_name)
 
-                            
             elif method.routing_key.endswith('.execute_update'):
                 file = payload['file']
                 new_version_id = payload['new_version_id']
@@ -793,8 +863,7 @@ class CABNfs(LoggingMixIn, Operations):
                     # Send empty success acknowledgement. 
                     self.process_reply({}, ch, props)
 
-                    print('Written on replica.')
-
+                    print("WROTE file " + file + " on replica node " + self.node_name)
 
             elif method.routing_key.endswith('.shutdown'):
                 self.on_shutdown()
@@ -889,7 +958,7 @@ class CABNfs(LoggingMixIn, Operations):
         # Verify non-existence on other servers.
         if path in self.get_all_files():
             # Log exception if the file exists.
-            logging.warning("ERROR_FILE_EXISTS: " + path)
+            print("ERROR_FILE_EXISTS: " + path)
         else:
             # Create the file locally.
             self.open_files.append(path)  # To prevent a rebalance delete.
@@ -948,9 +1017,8 @@ class CABNfs(LoggingMixIn, Operations):
             if (len(res)>0) and ('failure' in res[0]):
                 # If we are given a failure message.
                 # Client knows write was a success if the primary sends it a write order.
-                logging.warning("ERROR_TRUNC_FAIL: " + path)
-                logging.warning("ERROR_TRUNC_FAIL_REASON: " + res[0]['failure'])
-
+                print("ERROR_TRUNC_FAIL: " + path)
+                print("ERROR_TRUNC_FAIL_REASON: " + res[0]['failure'])
 
     def unlink(self, path):   
         if path[0] == '/':
@@ -960,7 +1028,8 @@ class CABNfs(LoggingMixIn, Operations):
             self.process_full_delete(path)
         else:
             # Get the primary.
-            responses = self.process_request_with_response({'file': path}, 'broadcast', 'broadcast.request.primary_status', 1)
+            responses = self.process_request_with_response({'file': path}, 'broadcast',
+                                                           'broadcast.request.primary_status', 1)
             if len(responses) > 0:
                 primary = responses[0]['sender']
                 # Send the primary a delete request.
@@ -989,24 +1058,25 @@ class CABNfs(LoggingMixIn, Operations):
         if self.file_primary_map[path] == self.node_name:
             responses = [{'sender': self.node_name}]
         else:
-            responses = self.process_request_with_response({'file': path}, 'broadcast', 'broadcast.request.primary_status', 1)
+            responses = self.process_request_with_response({'file': path}, 'broadcast',
+                                                           'broadcast.request.primary_status', 1)
         if len(responses) > 0:
             primary = responses[0]['sender']
             # Propose change to primary.
-            res = self.process_request_with_response({'file': path, 'data': data, 'offset': offset, 'version_id': self.local_version_id_dict[path]}, 
-                                                        'direct',
-                                                        self.get_direct_topic_prefix(primary) + 'propose_update', 1)
+            res = self.process_request_with_response({'file': path, 'data': data, 'offset': offset, 'version_id':
+                                                      self.local_version_id_dict[path]},
+                                                     'direct',
+                                                     self.get_direct_topic_prefix(primary) + 'propose_update', 1)
             # Use for testing conflicting writes: 'version_id': self.local_version_id_dict[path]-1
 
-            if (len(res)>0) and ('failure' in res[0]):
+            if (len(res) > 0) and ('failure' in res[0]):
                 # If we are given a failure message.
                 # Client knows write was a success if the primary sends it a write order.
-                logging.warning("ERROR_WRITE_FAIL: " + path)
-                logging.warning("ERROR_WRITE_FAIL_REASON: " + res[0]['failure'])
+                print("ERROR_WRITE_FAIL: " + path)
+                print("ERROR_WRITE_FAIL_REASON: " + res[0]['failure'])
                 return 0
 
             return data_length
-
 
     # =================== END FUSE API FUNCTIONS ===================
 
@@ -1014,7 +1084,7 @@ class CABNfs(LoggingMixIn, Operations):
 if __name__ == '__main__':
     if len(argv) != 4:
         print('usage: %s <root> <mountpoint> <replication_factor>' % argv[0])
-        exit(1)
+        exit()
 
     logging.basicConfig(filename="/app/debug_log.txt", level=logging.WARNING)
 
