@@ -746,6 +746,9 @@ class CABNfs(LoggingMixIn, Operations):
                             higher_versions = [v for v in self.write_history[file].keys() if v > file_version_sender]
                             if len(higher_versions) > 0:
                                 max_version = max(max_version,max(higher_versions))
+
+                                # Note for bare bones tasks, we would just set conflict to True here.
+
                             for v in higher_versions:
                                 if proposed_end == -1:  # If we are truncating.
                                     if self.write_history[file][v][1] == -1:  # If there was a truncate.
