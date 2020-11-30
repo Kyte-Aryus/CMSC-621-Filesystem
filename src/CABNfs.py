@@ -139,7 +139,7 @@ class CABNfs(LoggingMixIn, Operations):
                 print("WARNING: Unknown primary for file " + file + " at startup")
 
         # Let other servers know this node has joined for replication purposes
-        self.process_request({}, 'broadcast', 'broadcast.update.node_joined')
+        self.process_request({'files':local_files}, 'broadcast', 'broadcast.update.node_joined')
 
         print("---- STARTUP COMPLETE ----")
         print("---- NODE ONLINE ----")
@@ -374,6 +374,9 @@ class CABNfs(LoggingMixIn, Operations):
             if not found:
                 print("WARNING: No primary acknowledgement for " + file + ". File may be unavailable")
 
+        # Write version IDs.
+        self.update_version_file()
+
         # Note that if no other server has a replica for a file, we assume
         # this node is the last alive, therefore we can do a normal shutdown
         # Without checking
@@ -394,19 +397,25 @@ class CABNfs(LoggingMixIn, Operations):
             # Get the servers that are online
             ping_responses = self.process_request_with_response({}, 'broadcast', 'broadcast.request.ping',
                                                 self.max_node_count - 1)
-            # Send replica delete requests
-            replica_delete_responses = []
-            for replica_node in [r['sender'] for r in ping_responses]:
-                resp = self.process_request_with_response({'file': file}, 'direct',
-                                                    self.get_direct_topic_prefix(replica_node) + 'delete_file_replica', 1)
-                replica_delete_responses.extend(resp)
 
-            # Delete locally and update queues
-            if len(replica_delete_responses) == self.max_node_count - 1:
-                self.delete_local_file(file)
-                return True
+            # Are all nodes up?
+            if len(ping_responses) < self.max_node_count - 1:
+                print("WARNING: Nodes down. - Could not delete!")
             else:
-                return False
+                 
+                # Send replica delete requests
+                replica_delete_responses = []
+                for replica_node in [r['sender'] for r in ping_responses]:
+                    resp = self.process_request_with_response({'file': file}, 'direct',
+                                                        self.get_direct_topic_prefix(replica_node) + 'delete_file_replica', 1)
+                    replica_delete_responses.extend(resp)
+
+                # Delete locally and update queues
+                if len(replica_delete_responses) == self.max_node_count - 1:
+                    self.delete_local_file(file)
+                    return True
+                else:
+                    return False
 
     def delete_local_file(self, file):
 
@@ -494,7 +503,7 @@ class CABNfs(LoggingMixIn, Operations):
                 correlation_id=self.curr_response_corr_id,
                 expiration=self.requests_ttl
             ),
-            body=json.dumps(data))  # This assumes that x is a dict.
+            body=json.dumps(data))  
 
     # Sends reply
     def process_reply(self, data, channel, props):
@@ -582,6 +591,10 @@ class CABNfs(LoggingMixIn, Operations):
                 # Update local primary map
                 self.file_primary_map[file] = sender
 
+                # Reset version number if file is present.
+                if file in self.local_version_id_dict:
+                    self.local_version_id_dict[file] = 1
+
                 # We can stop keeping track of replicas
                 if file in self.file_replica_map:
                     self.file_replica_map[file] = list()
@@ -589,6 +602,13 @@ class CABNfs(LoggingMixIn, Operations):
             elif method.routing_key == 'broadcast.update.node_joined':
 
                 print("DETECTED NODE " + sender)
+
+                # If primary, update replica map.
+                node_files = payload['files']
+                for file in node_files:
+                    if self.file_primary_map[file] == self.node_name:
+                        self.file_replica_map[file].append(sender)
+
 
                 # For every file we primary, if we don't have enough replicas,
                 # replicate on the new server
@@ -721,7 +741,7 @@ class CABNfs(LoggingMixIn, Operations):
 
             elif method.routing_key.endswith('.propose_update'):
                 file = payload['file']
-                file_version_sender = payload['version_id']
+                file_version_sender = int(payload['version_id'])
                 proposed_data = payload['data']  # If data is 0, we are truncating. 
                 proposed_offset = payload['offset']  # If data is 0, truncation length.
 
@@ -730,112 +750,126 @@ class CABNfs(LoggingMixIn, Operations):
                     self.process_reply({'failure': 'rejection_not_primary'}, ch, props)
                 else:
 
-                    # Manage merges and conflicts.
-                    conflict = False
-                    with self.rwlock:
-                        # Proposed start and end of update.
-                        proposed_start = proposed_offset
-                        if proposed_data == 0:  # If truncation.
-                            proposed_end = -1
-                        else:
-                            proposed_end = proposed_start + len(base64.b64decode(proposed_data))
-
-                        # Check for higher versions.
-                        max_version = self.local_version_id_dict[file]
-                        if file in self.write_history:
-                            higher_versions = [v for v in self.write_history[file].keys() if v > file_version_sender]
-                            if len(higher_versions) > 0:
-                                max_version = max(max_version,max(higher_versions))
-
-                                # Note for bare bones tasks, we would just set conflict to True here.
-
-                            for v in higher_versions:
-                                if proposed_end == -1:  # If we are truncating.
-                                    if self.write_history[file][v][1] == -1:  # If there was a truncate.
-                                        if proposed_start > self.write_history[file][v][0]:
-                                            conflict = True
-                                            break
-                                    else:
-                                        if proposed_start < self.write_history[file][v][1]:
-                                            conflict = True
-                                            break
-
-                                else:
-                                    if self.write_history[file][v][1] == -1:  # If there was a truncate.
-                                        if proposed_end > self.write_history[file][v][0]:
-                                            conflict = True
-                                            break
-                                    else:
-                                        if (proposed_start < self.write_history[file][v][1]) and (self.write_history[file][v][0] < proposed_end):
-                                            conflict = True
-                                            break
-                        
-                        # If no conflict, assign a new version id for the write and log a write (deleted if unsuccessful later).
-                        if not conflict:
-                            proposed_version_id = max_version + 1
-                            if file not in self.write_history:
-                                self.write_history[file] = {}
-                            self.write_history[file][proposed_version_id] = [proposed_start, proposed_end]
-
-                    # If no conflict, continue writing.
-                    if conflict:
-                        self.process_reply({'failure': 'rejection_version_number'}, ch, props)
-                        print("WARNING: Conflict on " + file + " - Could not write!")
-
+                    # Are all nodes up?
+                    responses_all_nodes = self.process_request_with_response({}, 'broadcast', 'broadcast.request.ping',
+                                            self.max_node_count - 1)
+                    if len(responses_all_nodes) < self.max_node_count - 1:
+                        self.process_reply({'failure': 'rejection_nodes_down'}, ch, props)
+                        print("WARNING: Nodes down. - Could not write!")
                     else:
 
-                        # Primary needs to send update with an updated version number to all replicas.
-                        replica_write_responses = []
-                        replica_write_expected_responses = len(self.file_replica_map[file])
-                        for replica_node in self.file_replica_map[file]:
+                        # Manage merges and conflicts.
+                        conflict = False
+                        with self.rwlock:
+                            # Proposed start and end of update.
+                            proposed_start = proposed_offset
+                            if proposed_data == 0:  # If truncation.
+                                proposed_end = -1
+                            else:
+                                proposed_end = proposed_start + len(base64.b64decode(proposed_data))
 
-                            if replica_node == sender:
-                                replica_write_expected_responses = max(0, replica_write_expected_responses - 1)
-                                continue  # We update the proposer last as a confirm, if it is a replica.
+                            # Check for higher versions.
+                            max_version = self.local_version_id_dict[file]
+                            if file in self.write_history:
+                                higher_versions = [v for v in self.write_history[file].keys() if int(v) > file_version_sender]
+                                
+                                
+                                print(file_version_sender, max_version, higher_versions)
+                                
+                                
+                                if len(higher_versions) > 0:
+                                    max_version = max(max_version,max(higher_versions))
 
-                            resp = self.process_request_with_response(
-                                {'file': file, 
-                                 'offset': proposed_offset,
-                                 'data': proposed_data,
-                                 'new_version_id': proposed_version_id},
-                                'direct', self.get_direct_topic_prefix(replica_node) + 'execute_update', 1)
-                            replica_write_responses.extend(resp)
+                                    # Note for bare bones tasks, we would just set conflict to True here.
 
-                        # Are replica writes are successful?
-                        if len(replica_write_responses) != replica_write_expected_responses:
-                            self.process_reply({'failure': 'rejection_replica_writes'}, ch, props)
-                            # If fail, undo the proposed write in the history.
-                            self.write_history[file].pop(proposed_version_id, None)
+                                for v in higher_versions:
+                                    if proposed_end == -1:  # If we are truncating.
+                                        if self.write_history[file][v][1] == -1:  # If there was a truncate.
+                                            if proposed_start > self.write_history[file][v][0]:
+                                                conflict = True
+                                                break
+                                        else:
+                                            if proposed_start < self.write_history[file][v][1]:
+                                                conflict = True
+                                                break
+
+                                    else:
+                                        if self.write_history[file][v][1] == -1:  # If there was a truncate.
+                                            if proposed_end > self.write_history[file][v][0]:
+                                                conflict = True
+                                                break
+                                        else:
+                                            if (proposed_start < self.write_history[file][v][1]) and (self.write_history[file][v][0] < proposed_end):
+                                                conflict = True
+                                                break
+                            
+                            # If no conflict, assign a new version id for the write and log a write (deleted if unsuccessful later).
+                            if not conflict:
+                                proposed_version_id = max_version + 1
+                                if file not in self.write_history:
+                                    self.write_history[file] = {}
+                                self.write_history[file][proposed_version_id] = [proposed_start, proposed_end]
+
+                        # If no conflict, continue writing.
+                        if conflict:
+                            self.process_reply({'failure': 'rejection_version_number'}, ch, props)
+                            print("WARNING: Conflict on " + file + " - Could not write!")
+
                         else:
 
-                            # Send confirm to proposer, if proposer not self.
-                            if sender != self.node_name:
-                                _ = self.process_request_with_response(
+
+                            # Primary needs to send update with an updated version number to all replicas.
+                            replica_write_responses = []
+                            replica_write_expected_responses = len(self.file_replica_map[file])
+                            for replica_node in self.file_replica_map[file]:
+
+                                if replica_node == sender:
+                                    replica_write_expected_responses = max(0, replica_write_expected_responses - 1)
+                                    continue  # We update the proposer last as a confirm, if it is a replica.
+
+                                resp = self.process_request_with_response(
                                     {'file': file, 
-                                     'offset': proposed_offset,
-                                     'data': proposed_data,
-                                     'new_version_id': proposed_version_id},
-                                    'direct', self.get_direct_topic_prefix(sender) + 'execute_update', 1) 
+                                    'offset': proposed_offset,
+                                    'data': proposed_data,
+                                    'new_version_id': proposed_version_id},
+                                    'direct', self.get_direct_topic_prefix(replica_node) + 'execute_update', 1)
+                                replica_write_responses.extend(resp)
 
-                            # Primary needs to apply change to own copy and update version.
-                            
-                            # Truncation.
-                            if proposed_data == 0:
-                                with open(self._real_path(file), 'r+') as f:
-                                    f.truncate(proposed_offset)
-
-                            # Write.
+                            # Are replica writes are successful?
+                            if len(replica_write_responses) != replica_write_expected_responses:
+                                self.process_reply({'failure': 'rejection_replica_writes'}, ch, props)
+                                # If fail, undo the proposed write in the history.
+                                self.write_history[file].pop(proposed_version_id, None)
                             else:
-                                with self.rwlock:
-                                    fh = os.open(self._real_path(file), os.O_RDWR) 
-                                    os.lseek(fh, proposed_offset, 0)
-                                    os.write(fh, base64.b64decode(proposed_data))  # Decode to write.
-                                    os.close(fh) 
 
-                            # Update local version id.
-                            self.local_version_id_dict[file] = proposed_version_id
+                                # Send confirm to proposer, if proposer not self.
+                                if sender != self.node_name:
+                                    _ = self.process_request_with_response(
+                                        {'file': file, 
+                                        'offset': proposed_offset,
+                                        'data': proposed_data,
+                                        'new_version_id': proposed_version_id},
+                                        'direct', self.get_direct_topic_prefix(sender) + 'execute_update', 1) 
 
-                            print("WROTE file " + file + " on primary node " + self.node_name)
+                                # Primary needs to apply change to own copy and update version.
+                                
+                                # Truncation.
+                                if proposed_data == 0:
+                                    with open(self._real_path(file), 'r+') as f:
+                                        f.truncate(proposed_offset)
+
+                                # Write.
+                                else:
+                                    with self.rwlock:
+                                        fh = os.open(self._real_path(file), os.O_RDWR) 
+                                        os.lseek(fh, proposed_offset, 0)
+                                        os.write(fh, base64.b64decode(proposed_data))  # Decode to write.
+                                        os.close(fh) 
+
+                                # Update local version id.
+                                self.local_version_id_dict[file] = proposed_version_id
+
+                                print("WROTE file " + file + " on primary node " + self.node_name)
 
             elif method.routing_key.endswith('.execute_update'):
                 file = payload['file']

@@ -3,7 +3,7 @@ import sys
 import pika
 import json
 
-# Get queue name
+# Get queue name.
 queue = "rabbit@node" + str(sys.argv[1])
 routing_key = "direct." + queue + ".shutdown"
 
@@ -17,7 +17,7 @@ channel.exchange_declare(exchange='direct', exchange_type='topic')
 # Message data.
 data = {'sender': os.environ['RABBITMQ_NODENAME']}
 
-# Send a message to all nodes. 
+# Send a message to the node. 
 channel.basic_publish(exchange='direct', routing_key=routing_key, body=json.dumps(data))
 
 # Close connection.
