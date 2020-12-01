@@ -14,5 +14,5 @@ tv28617@umbc.edu
 7. `/filesystem/` is where local data is stored. File operations however should operate on `/mountpoint/`. This allows for modification of files in `/mountpoint/` to perform validation and communication logic prior to changes to `/filesystem/`. `debug_log.txt` shows the recorded events in the mounted filesystem. These events are hooked into using FUSE, as implemented by `src/CABNfs.py`  
 8. View cluster status at `http://localhost:15672` (guest/guest). For some reason, detailed node statistics are not showing up on the manager monitor.   
 9. Shutdown a node (but not the container) using `shutdown.py`  
-10. Shutdown the cluster with `docker-compose down`  
-
+10. Shutdown the cluster with `docker-compose down`   
+11. Client simulation and metrics analysis in `tests/`  

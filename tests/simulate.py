@@ -16,7 +16,7 @@ interrupted = False
 
 
 # Directory where operations are executed.
-datadir = './tmp/'  # TODO: change to `/mountpoint/` when ready.
+datadir = '/mountpoint/'  
 
 
 # Parse arguments.
@@ -24,7 +24,7 @@ parser = argparse.ArgumentParser(description='Simulate client interactions.')
 parser.add_argument('action', type=str, help='simulate this action')
 parser.add_argument('sleep', type=float, help='sleep time (seconds) between actions')
 parser.add_argument('output', type=str, help='output file to write to')
-parser.add_argument('--fs', dest='fs', type=int, default=1, help='file size (MB) (default: 1)')
+parser.add_argument('--fs', dest='fs', type=int, default=1, help='file size (KB) (default: 1)')
 args = parser.parse_args()
 
 
@@ -37,10 +37,27 @@ results = {
 
 
 # Create some data.
-data = 'a' * args.fs * 1000000
+data = 'a' * args.fs * 1000
 
 
 # Action definitions.
+
+def list_files():
+    try:
+        _ = os.listdir(datadir)
+        return 0
+    except Exception as err:
+        print(err)
+        return 1
+
+def delete_file(filename='testfile.txt'):
+    try:
+        _ = os.remove(os.path.join(datadir, filename))
+        return 0
+    except Exception as err:
+        print(err)
+        return 1
+
 def toy():
     if random.random() < 0.1:
         return 1
@@ -50,6 +67,15 @@ def toy():
 def create_file(filename='testfile.txt'):
     try:
         with open(os.path.join(datadir, filename),'w') as fd:
+            pass 
+        return 0
+    except Exception as err:
+        print(err)
+        return 1
+
+def write_file(filename='testfile.txt'):
+    try:
+        with open(os.path.join(datadir, filename),'a') as fd:
             fd.write(data)
         return 0
     except Exception as err:
@@ -76,10 +102,14 @@ def append_file(filename='testfile.txt'):
 
 
 # Make sure we use a valid action.
-assert args.action in ['toy','write_one','read_one','append_one'], 'invalid action'
+assert args.action in ['delete_one', 'create_one', 'list_files', 'toy','write_one','read_one','append_one'], 'invalid action'
 
 # Run loop.
-while True:
+for _ in range(12):
+
+    if args.action == 'delete_one':
+        _ = complete_success = create_file()
+        time.sleep(args.sleep)
 
     # Run action.
     start_time = time.time()
@@ -87,13 +117,23 @@ while True:
     if args.action == 'toy':
         complete_success = toy()
     elif args.action == 'write_one':
-        complete_success = create_file()
+        complete_success = write_file()
     elif args.action == 'read_one':
         complete_success = read_file()
     elif args.action == 'append_one':
         complete_success = append_file()
+    elif args.action == 'list_files':
+        complete_success = list_files()
+    elif args.action == 'delete_one':
+        complete_success = delete_file()
+    elif args.action == 'create_one':
+        complete_success = create_file()
 
     complete_time = time.time()-start_time
+
+    if args.action == 'create_one':
+        _ = complete_success = delete_file()
+        time.sleep(args.sleep)
 
     # Log results.
     results['timestamp'].append(start_time)
@@ -110,9 +150,9 @@ while True:
 
 
 # Create a results directory if doesn't exist.
-if not os.path.exists('./results/'):
+if not os.path.exists('/app/results/'):
     os.makedirs('./results/')
 
 # Save results.
-with open(os.path.join('./results/', args.output), 'w') as outfile:  
+with open(os.path.join('/app/results/', args.output), 'w') as outfile:  
     json.dump(results, outfile) 
